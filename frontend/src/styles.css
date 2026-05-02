@@ -276,9 +276,15 @@ button:disabled {
   background: #f8fafc;
 }
 
-.map-wrap,
-.map {
+.map-wrap {
+  display: flex;
+  flex-direction: column;
   min-height: 100vh;
+}
+
+.map {
+  flex: 1;
+  min-height: 480px;
 }
 
 .route-line {
@@ -493,6 +499,104 @@ button:disabled {
   color: #b45309;
 }
 
+/* ── Vehicle status strip ── */
+.vehicle-strip {
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px;
+  background: #ffffff;
+  border-top: 1px solid #dbe3ef;
+  overflow-x: auto;
+  flex-shrink: 0;
+}
+
+.vstrip-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 9px 12px;
+  border: 1px solid #dbe3ef;
+  border-radius: 8px;
+  background: #f8fafc;
+  min-width: 170px;
+  flex-shrink: 0;
+}
+
+.vstrip-dot {
+  margin-top: 3px;
+  flex-shrink: 0;
+}
+
+.vstrip-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.vstrip-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.vstrip-top strong {
+  font-size: 12px;
+  color: #1e293b;
+  white-space: nowrap;
+}
+
+.vstrip-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 999px;
+  white-space: nowrap;
+  background: #e2e8f0;
+  color: #475569;
+}
+
+.vstrip-moving { background: #dbeafe; color: #1d4ed8; }
+.vstrip-servicing_delivery { background: #dcfce7; color: #15803d; }
+.vstrip-servicing_return { background: #fce7f3; color: #be185d; }
+.vstrip-done { background: #f1f5f9; color: #94a3b8; }
+
+.vstrip-bar {
+  overflow: hidden;
+  height: 5px;
+  border-radius: 999px;
+  background: #e2e8f0;
+}
+
+.vstrip-bar span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+
+.vstrip-bottom {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 10px;
+  color: #64748b;
+}
+
+.vstrip-next {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 90px;
+  color: #334155;
+}
+
+.vstrip-done {
+  color: #94a3b8;
+}
+
 /* ── Action buttons ── */
 .btn-plan {
   background: #7c3aed;
@@ -583,8 +687,11 @@ button:disabled {
     max-height: none;
   }
 
-  .map-wrap,
-  .map {
+  .map-wrap {
     min-height: 560px;
+  }
+
+  .map {
+    min-height: 480px;
   }
 }

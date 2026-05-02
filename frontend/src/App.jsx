@@ -384,6 +384,45 @@ export default function App() {
             </CircleMarker>
           ))}
         </MapContainer>
+
+        {/* Vehicle status strip */}
+        {state?.couriers?.length > 0 && (
+          <div className="vehicle-strip">
+            {state.couriers.map((courier) => {
+              const pending = courier.route.filter(
+                (s) => s.status === 'pending' && s.kind !== 'hub',
+              ).length;
+              const pct = Math.min(100, Math.round((courier.current_load / courier.capacity_desi) * 100));
+              const nextStop = courier.route.find((s) => s.status === 'pending' && s.kind !== 'hub');
+              return (
+                <div key={courier.id} className="vstrip-card">
+                  <span className="dot vstrip-dot" style={{ background: courier.color }} />
+                  <div className="vstrip-info">
+                    <div className="vstrip-top">
+                      <strong>{courier.name}</strong>
+                      <span className={`vstrip-badge vstrip-${courier.movement_status}`}>
+                        {statusLabel(courier.movement_status)}
+                      </span>
+                    </div>
+                    <div className="vstrip-bar">
+                      <span style={{ width: `${pct}%`, background: courier.color }} />
+                    </div>
+                    <div className="vstrip-bottom">
+                      <span>{courier.current_load}/{courier.capacity_desi} desi</span>
+                      {nextStop ? (
+                        <span className="vstrip-next" title={nextStop.label}>
+                          → {nextStop.label}
+                        </span>
+                      ) : (
+                        <span className="vstrip-done">{pending === 0 ? 'bos' : `${pending} durak`}</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </section>
 
       {/* RIGHT PANEL */}
