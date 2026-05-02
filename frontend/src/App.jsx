@@ -1,15 +1,16 @@
 import { useEffect, useMemo, useState } from 'react';
 import { MapContainer, Marker, Polyline, Popup, TileLayer, CircleMarker } from 'react-leaflet';
 import L from 'leaflet';
-import { PackagePlus, Pause, Play, RotateCcw, StepForward, Truck, Timer, MapPin } from 'lucide-react';
+import { PackageCheck, PackagePlus, Pause, Play, RotateCcw, StepForward, Truck, Timer, MapPin } from 'lucide-react';
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000';
 const CENTER = [41.1956, 32.6227];
+const SPEED_OPTIONS = [1, 2, 4, 8];
 
 function markerIcon(color, status) {
   return L.divIcon({
     className: `courier-marker ${status}`,
-    html: `<span style="background:${color}"></span>`,
+    html: `<span style="background:${color};color:${color}"></span>`,
     iconSize: [24, 24],
     iconAnchor: [12, 12],
   });
@@ -36,6 +37,16 @@ function statusLabel(status) {
     done: 'tamamlandi',
   };
   return labels[status] ?? status;
+}
+
+function loadBreakdown(courier) {
+  const deliveryLoad = courier.route
+    .filter((stop) => stop.kind === 'delivery' && stop.status === 'pending')
+    .reduce((total, stop) => total + stop.desi, 0);
+  return {
+    deliveryLoad,
+    returnLoad: Math.max(0, courier.current_load - deliveryLoad),
+  };
 }
 
 export default function App() {
@@ -84,7 +95,7 @@ export default function App() {
 
   return (
     <main className="shell">
-      <aside className="panel">
+      <aside className="panel left-panel">
         <header>
           <div>
             <p>Karabuk Merkez - OSM graph</p>
@@ -95,7 +106,8 @@ export default function App() {
 
         <section className="meta-row">
           <span>Tick {state?.tick ?? 0}</span>
-          <span>Hiz {state?.speed_kmh ?? 35} km/s</span>
+          <span>Arac hizi {state?.speed_kmh ?? 70} km/s</span>
+          <span>Sim {state?.speed_multiplier ?? 2}x</span>
           <span>{state?.graph_source ?? 'graph bekleniyor'}</span>
         </section>
 
@@ -135,24 +147,24 @@ export default function App() {
           </button>
         </section>
 
-        <section className="controls two">
-          <label>
-            Iade desi
-            <input type="number" value={returnDesi} onChange={(event) => setReturnDesi(Number(event.target.value))} />
-          </label>
-          <button
-            onClick={() =>
-              run(() =>
-                api('/api/returns', {
-                  method: 'POST',
-                  body: JSON.stringify({ desi: returnDesi }),
-                }),
-              )
-            }
-            disabled={busy || !started}
-          >
-            <PackagePlus size={18} /> Iade Ekle
-          </button>
+        <section className="speed-control">
+          {SPEED_OPTIONS.map((multiplier) => (
+            <button
+              key={multiplier}
+              className={state?.speed_multiplier === multiplier ? 'active' : ''}
+              onClick={() =>
+                run(() =>
+                  api('/api/sim/speed', {
+                    method: 'POST',
+                    body: JSON.stringify({ multiplier }),
+                  }),
+                )
+              }
+              disabled={busy}
+            >
+              {multiplier}x
+            </button>
+          ))}
         </section>
 
         {error && <div className="error">{error}</div>}
@@ -164,6 +176,7 @@ export default function App() {
           <div className="cards">
             {state?.couriers?.map((courier) => {
               const loadPercent = Math.round((courier.current_load / courier.capacity_desi) * 100);
+              const { deliveryLoad, returnLoad } = loadBreakdown(courier);
               return (
                 <article className="card" key={courier.id}>
                   <div className="card-title">
@@ -173,6 +186,10 @@ export default function App() {
                   </div>
                   <div className="bar">
                     <span style={{ width: `${Math.min(100, loadPercent)}%`, background: courier.color }} />
+                  </div>
+                  <div className="load-split">
+                    <span>Teslimat {deliveryLoad} desi</span>
+                    <span>Iade {returnLoad} desi</span>
                   </div>
                   <p>{courier.route.filter((stop) => stop.status === 'pending').length} bekleyen durak</p>
                   <p>
@@ -186,31 +203,6 @@ export default function App() {
           </div>
         </section>
 
-        <section>
-          <h2>
-            <Timer size={18} /> Iade Havuzu
-          </h2>
-          <div className="pool">
-            {(state?.pending_returns?.length ?? 0) === 0 && <p>Bekleyen iade yok.</p>}
-            {state?.pending_returns?.map((job) => (
-              <article className="pool-item" key={job.id}>
-                <strong>{job.desi} desi</strong>
-                <span>{job.message}</span>
-              </article>
-            ))}
-          </div>
-        </section>
-
-        <section>
-          <h2>
-            <MapPin size={18} /> Olay Akisi
-          </h2>
-          <div className="log">
-            {(state?.messages ?? []).slice().reverse().map((message, index) => (
-              <p key={`${message}-${index}`}>{message}</p>
-            ))}
-          </div>
-        </section>
       </aside>
 
       <section className="map-wrap">
@@ -219,6 +211,37 @@ export default function App() {
             attribution="&copy; OpenStreetMap contributors"
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
+          {state?.couriers?.map((courier) =>
+            courier.polyline?.length ? (
+              <Polyline
+                key={`${courier.id}-route-shadow`}
+                positions={courier.polyline}
+                pathOptions={{
+                  color: courier.color,
+                  weight: 12,
+                  opacity: 0.18,
+                  lineCap: 'round',
+                  lineJoin: 'round',
+                }}
+              />
+            ) : null,
+          )}
+          {state?.couriers?.map((courier) =>
+            courier.polyline?.length ? (
+              <Polyline
+                key={`${courier.id}-route`}
+                positions={courier.polyline}
+                pathOptions={{
+                  color: courier.color,
+                  weight: 5,
+                  opacity: 0.92,
+                  lineCap: 'round',
+                  lineJoin: 'round',
+                  className: `route-line ${courier.movement_status === 'moving' ? 'moving' : ''}`,
+                }}
+              />
+            ) : null,
+          )}
           {state?.couriers?.map((courier) => (
             <Marker
               key={courier.id}
@@ -234,11 +257,6 @@ export default function App() {
               </Popup>
             </Marker>
           ))}
-          {state?.couriers?.map((courier) =>
-            courier.polyline?.length ? (
-              <Polyline key={`${courier.id}-line`} positions={courier.polyline} color={courier.color} weight={5} />
-            ) : null,
-          )}
           {state?.couriers?.flatMap((courier) =>
             courier.route.map((stop) => (
               <CircleMarker
@@ -263,10 +281,14 @@ export default function App() {
               key={job.id}
               center={[job.lat, job.lon]}
               radius={9}
-              pathOptions={{ color: '#dc2626', fillColor: '#fca5a5', fillOpacity: 0.95 }}
+              pathOptions={{
+                color: job.deferred ? '#ca8a04' : '#dc2626',
+                fillColor: job.deferred ? '#fde68a' : '#fca5a5',
+                fillOpacity: 0.95,
+              }}
             >
               <Popup>
-                <strong>Havuzdaki iade</strong>
+                <strong>{job.deferred ? 'Oncelikli iade' : 'Havuzdaki iade'}</strong>
                 <br />
                 {job.desi} desi
               </Popup>
@@ -274,6 +296,75 @@ export default function App() {
           ))}
         </MapContainer>
       </section>
+
+      <aside className="panel right-panel">
+        <section className="controls two">
+          <label>
+            Iade desi
+            <input type="number" value={returnDesi} onChange={(event) => setReturnDesi(Number(event.target.value))} />
+          </label>
+          <button
+            onClick={() =>
+              run(() =>
+                api('/api/returns', {
+                  method: 'POST',
+                  body: JSON.stringify({ desi: returnDesi }),
+                }),
+              )
+            }
+            disabled={busy || !started}
+          >
+            <PackagePlus size={18} /> Iade Ekle
+          </button>
+        </section>
+
+        <section>
+          <h2>
+            <Timer size={18} /> Iade Havuzu
+          </h2>
+          <div className="pool">
+            {(state?.pending_returns?.length ?? 0) === 0 && <p>Bekleyen iade yok.</p>}
+            {state?.pending_returns?.map((job) => (
+              <article className={`pool-item ${job.deferred ? 'deferred' : ''}`} key={job.id}>
+                <div>
+                  <strong>{job.desi} desi</strong>
+                  {job.deferred && <small>Oncelikli</small>}
+                </div>
+                <span>{job.message}</span>
+              </article>
+            ))}
+          </div>
+        </section>
+
+        <section>
+          <h2>
+            <PackageCheck size={18} /> Tamamlanan Iadeler
+          </h2>
+          <div className="pool">
+            {(state?.completed_returns?.length ?? 0) === 0 && <p>Tamamlanan iade yok.</p>}
+            {state?.completed_returns?.map((job) => (
+              <article className="pool-item completed" key={job.id}>
+                <div>
+                  <strong>{job.desi} desi</strong>
+                  <small>{job.assigned_courier_id}</small>
+                </div>
+                <span>{job.message}</span>
+              </article>
+            ))}
+          </div>
+        </section>
+
+        <section>
+          <h2>
+            <MapPin size={18} /> Olay Akisi
+          </h2>
+          <div className="log">
+            {(state?.messages ?? []).slice().reverse().map((message, index) => (
+              <p key={`${message}-${index}`}>{message}</p>
+            ))}
+          </div>
+        </section>
+      </aside>
     </main>
   );
 }

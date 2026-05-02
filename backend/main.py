@@ -18,9 +18,12 @@ from pydantic import BaseModel, Field
 
 KARABUK_CENTER = {"lat": 41.1956, "lon": 32.6227}
 SPATIAL_TRIGGER_KM = float(os.getenv("SPATIAL_TRIGGER_KM", "2.0"))
-SIM_SPEED_KMH = float(os.getenv("SIM_SPEED_KMH", "35"))
+SIM_SPEED_KMH = float(os.getenv("SIM_SPEED_KMH", "70"))
 GRAPH_PLACE = os.getenv("GRAPH_PLACE", "Karabuk Merkez, Karabuk, Turkiye")
-GRAPH_CACHE_PATH = Path(os.getenv("GRAPH_CACHE_PATH", "backend/data/karabuk_drive.graphml"))
+BACKEND_DIR = Path(__file__).resolve().parent
+GRAPH_CACHE_PATH = Path(
+    os.getenv("GRAPH_CACHE_PATH", str(BACKEND_DIR / "data" / "karabuk_drive.graphml"))
+)
 
 KARABUK_POINTS = [
     {"lat": 41.2067, "lon": 32.6271},
@@ -62,6 +65,10 @@ class ReturnRequest(BaseModel):
     lon: float | None = Field(default=None, ge=-180, le=180)
 
 
+class SpeedRequest(BaseModel):
+    multiplier: float = Field(default=1.0, ge=0.25, le=8.0)
+
+
 @dataclass
 class Stop:
     id: str
@@ -82,10 +89,11 @@ class ReturnJob:
     lon: float
     node: int
     desi: int
-    status: Literal["pending", "assigned", "unassigned"] = "pending"
+    status: Literal["pending", "assigned", "completed", "unassigned"] = "pending"
     assigned_courier_id: str | None = None
     created_at: float = field(default_factory=time.time)
     message: str = "Havuzda bekliyor"
+    deferred: bool = False
 
 
 @dataclass
@@ -127,6 +135,7 @@ class SimState:
     pending_returns: list[ReturnJob] = field(default_factory=list)
     completed_returns: list[ReturnJob] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)
+    speed_multiplier: float = 2.0
 
 
 state = SimState()
@@ -310,7 +319,74 @@ def point_from_pool(rng: random.Random, used: set[int]) -> dict[str, float]:
     }
 
 
-def random_graph_node(rng: random.Random, used: set[int]) -> int:
+def normalize_highways(highway: object) -> set[str]:
+    if isinstance(highway, str):
+        return {highway}
+    if isinstance(highway, list):
+        return {str(item) for item in highway}
+    return set()
+
+
+def adjacent_highways(node: int) -> set[str]:
+    graph = get_graph()
+    highways: set[str] = set()
+    for _, _, data in graph.edges(node, data=True):
+        highways.update(normalize_highways(data.get("highway")))
+    return highways
+
+
+def node_is_far_enough(node: int, used: set[int], min_distance_km: float) -> bool:
+    if node in used:
+        return False
+    if min_distance_km <= 0 or not used:
+        return True
+
+    lat, lon = node_lat_lon(node)
+    for used_node in used:
+        used_lat, used_lon = node_lat_lon(used_node)
+        if haversine_km(lat, lon, used_lat, used_lon) < min_distance_km:
+            return False
+    return True
+
+
+def random_graph_node(
+    rng: random.Random,
+    used: set[int],
+    min_distance_km: float = 0.35,
+) -> int:
+    graph = get_graph()
+    preferred_highways = {
+        "residential",
+        "service",
+        "living_street",
+        "tertiary",
+        "secondary",
+        "unclassified",
+    }
+    excluded_highways = {"motorway", "trunk"}
+    candidates: list[int] = []
+    fallback_candidates: list[int] = []
+
+    for node, data in graph.nodes(data=True):
+        if not node_is_far_enough(node, used, min_distance_km):
+            continue
+        lat = float(data["y"])
+        lon = float(data["x"])
+        if haversine_km(KARABUK_CENTER["lat"], KARABUK_CENTER["lon"], lat, lon) > 6.0:
+            continue
+
+        highways = adjacent_highways(node)
+        if highways and highways.isdisjoint(excluded_highways):
+            fallback_candidates.append(node)
+        if highways & preferred_highways:
+            candidates.append(node)
+
+    pool = candidates or fallback_candidates
+    if pool:
+        node = rng.choice(pool)
+        used.add(node)
+        return int(node)
+
     point = point_from_pool(rng, used)
     return nearest_node(point["lat"], point["lon"])
 
@@ -401,6 +477,19 @@ def complete_service(courier: Courier) -> None:
     elif stop.kind == "return":
         courier.current_load = min(courier.capacity_desi, courier.current_load + stop.desi)
         state.messages.append(f"{courier.name} {stop.desi} desi iade aldi")
+        if not any(job.id == stop.id for job in state.completed_returns):
+            state.completed_returns.append(
+                ReturnJob(
+                    id=stop.id,
+                    lat=stop.lat,
+                    lon=stop.lon,
+                    node=stop.node,
+                    desi=stop.desi,
+                    status="completed",
+                    assigned_courier_id=courier.id,
+                    message=f"{courier.name} tarafindan tamamlandi",
+                )
+            )
 
     courier.active_stop_id = None
     courier.service_remaining_seconds = 0.0
@@ -480,7 +569,7 @@ async def advance_running_state() -> None:
         state.last_update_at = now
         return
 
-    elapsed = min(10.0, max(0.0, now - state.last_update_at))
+    elapsed = min(10.0, max(0.0, now - state.last_update_at)) * state.speed_multiplier
     state.last_update_at = now
     if elapsed <= 0:
         return
@@ -546,7 +635,8 @@ async def try_assign_return(job: ReturnJob) -> bool:
                 best = (extra_cost, courier, idx)
 
     if best is None:
-        job.message = "Yakinlik veya kapasite uygunlugu bulunamadi"
+        if not job.deferred:
+            job.message = "Yakinlik veya kapasite uygunlugu bulunamadi"
         return False
 
     extra_cost, courier, insertion_index = best
@@ -570,18 +660,44 @@ async def try_assign_return(job: ReturnJob) -> bool:
 
     job.status = "assigned"
     job.assigned_courier_id = courier.id
+    job.deferred = False
     job.message = f"{courier.name} rotasina eklendi (+{extra_cost / 1000:.2f} km)"
-    state.completed_returns.append(job)
     state.messages.append(job.message)
     rebuild_courier_path(courier)
     return True
 
 
+def simulation_finished() -> bool:
+    return state.started and bool(state.couriers) and all(
+        courier.movement_status == "done" for courier in state.couriers
+    )
+
+
+def defer_pending_returns() -> None:
+    if not state.pending_returns or not simulation_finished():
+        return
+
+    changed = False
+    for job in state.pending_returns:
+        if job.status == "pending" and not job.deferred:
+            job.deferred = True
+            job.message = "Yarina ertelendi - oncelikli"
+            changed = True
+
+    state.pending_returns.sort(key=lambda job: (not job.deferred, job.created_at))
+    if changed:
+        state.running = False
+        state.last_update_at = None
+        state.messages.append("Atanamayan iadeler yarina ertelendi ve onceliklendirildi")
+
+
 async def evaluate_return_pool() -> None:
+    state.pending_returns.sort(key=lambda job: (not job.deferred, job.created_at))
     for job in list(state.pending_returns):
         assigned = await try_assign_return(job)
         if assigned:
             state.pending_returns.remove(job)
+    defer_pending_returns()
 
 
 def remaining_polyline(courier: Courier) -> list[list[float]]:
@@ -616,7 +732,18 @@ def serialize_return(job: ReturnJob) -> dict:
         "assigned_courier_id": job.assigned_courier_id,
         "message": job.message,
         "created_at": job.created_at,
+        "deferred": job.deferred,
     }
+
+
+def occupied_stop_nodes() -> set[int]:
+    nodes: set[int] = set()
+    for courier in state.couriers:
+        nodes.add(courier.node)
+        nodes.update(stop.node for stop in courier.route)
+    nodes.update(job.node for job in state.pending_returns)
+    nodes.update(job.node for job in state.completed_returns)
+    return nodes
 
 
 def state_response() -> dict:
@@ -626,6 +753,7 @@ def state_response() -> dict:
         "seed": state.seed,
         "tick": state.tick,
         "speed_kmh": SIM_SPEED_KMH,
+        "speed_multiplier": state.speed_multiplier,
         "graph_source": graph_source,
         "spatial_trigger_km": SPATIAL_TRIGGER_KM,
         "messages": state.messages[-10:],
@@ -659,6 +787,9 @@ async def start_simulation(request: StartRequest) -> dict:
     if request.min_deliveries > request.max_deliveries:
         raise HTTPException(status_code=400, detail="min_deliveries max_deliveries degerinden buyuk olamaz")
 
+    deferred_returns = [
+        job for job in state.pending_returns if job.deferred and job.status == "pending"
+    ]
     get_graph()
     rng = random.Random(request.seed)
     used_points: set[int] = set()
@@ -716,8 +847,13 @@ async def start_simulation(request: StartRequest) -> dict:
         running=False,
         seed=request.seed,
         couriers=couriers,
+        pending_returns=deferred_returns,
+        speed_multiplier=state.speed_multiplier,
         messages=[f"Simulasyon {len(couriers)} aracla baslatildi"],
     )
+    if deferred_returns:
+        state.messages.append(f"{len(deferred_returns)} ertelenen iade oncelikli havuza tasindi")
+        await evaluate_return_pool()
     return state_response()
 
 
@@ -740,6 +876,16 @@ async def pause_simulation() -> dict:
     return state_response()
 
 
+@app.post("/api/sim/speed")
+async def set_simulation_speed(request: SpeedRequest) -> dict:
+    await advance_running_state()
+    state.speed_multiplier = request.multiplier
+    if state.running:
+        state.last_update_at = time.time()
+    state.messages.append(f"Simulasyon hizi {request.multiplier:g}x yapildi")
+    return state_response()
+
+
 @app.post("/api/returns")
 async def create_return(request: ReturnRequest) -> dict:
     await advance_running_state()
@@ -750,7 +896,7 @@ async def create_return(request: ReturnRequest) -> dict:
     if request.lat is not None and request.lon is not None:
         node = nearest_node(request.lat, request.lon)
     else:
-        node = random_graph_node(rng, set())
+        node = random_graph_node(rng, occupied_stop_nodes())
     lat, lon = node_lat_lon(node)
     job = ReturnJob(
         id=str(uuid4()),
@@ -770,7 +916,7 @@ async def tick() -> dict:
     if not state.started:
         raise HTTPException(status_code=400, detail="Once simulasyonu baslatin")
     for courier in state.couriers:
-        advance_courier(courier, 5.0)
+        advance_courier(courier, 5.0 * state.speed_multiplier)
     state.tick += 1
     await evaluate_return_pool()
     return state_response()
