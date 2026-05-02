@@ -1,22 +1,23 @@
 # Dinamik Kargo Rotalama Demo
 
-FastAPI + React/Vite tabanlı OSRM destekli demo:
+FastAPI + React/Vite tabanli OSM graph destekli demo:
 
-- Araç sayısı ve desi kapasiteleri kullanıcıdan alınır.
-- Karabük Merkez için seed'li rastgele teslimat durakları üretilir.
-- İadeler havuza eklenir, hemen atanmaz.
-- Tick ilerledikçe yakınlık tetikleyici çalışır.
-- OSRM Table API Best Insertion kararını verir.
-- OSRM Route API frontend polyline verisini üretir.
+- Arac sayisi ve desi kapasiteleri kullanicidan alinir.
+- Karabuk Merkez icin seed'li rastgele teslimat duraklari OSM yol graph'ina snap edilir.
+- Iadeler havuza eklenir, hemen atanmaz.
+- Backend graph uzerinde araclari canli ilerletir.
+- Yakinlik tetikleyici calisinca Best Insertion iade noktasini rotaya ekler.
+- Rota mesafeleri NetworkX shortest path length ile hesaplanir.
+- Ilk calistirmada OSMnx graph olusturulur ve `backend/data/karabuk_drive.graphml` olarak cache'lenir.
 
-## Çalıştırma
+## Calistirma
 
 Backend:
 
 ```powershell
 cd backend
 python -m pip install -r requirements.txt
-uvicorn main:app --reload --host 127.0.0.1 --port 8000
+python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 Frontend:
@@ -27,16 +28,20 @@ npm install
 npm run dev
 ```
 
-OSRM varsayılan adresi:
-
-```text
-http://127.0.0.1:5000
-```
-
-Farklı adres için backend'i `OSRM_BASE_URL` ortam değişkeniyle başlatın.
-
-OSRM çalışmıyorsa demo durmaz. Backend varsayılan olarak Haversine mesafe matrisi ve düz çizgi polyline fallback'i kullanır. Bunu kapatmak için:
+Canli hareket hizi varsayilan olarak 35 km/s'dir. Degistirmek icin:
 
 ```powershell
-$env:OSRM_FALLBACK_ENABLED="false"
+$env:SIM_SPEED_KMH="50"
+```
+
+Graph cache yolunu degistirmek icin:
+
+```powershell
+$env:GRAPH_CACHE_PATH="backend/data/karabuk_drive.graphml"
+```
+
+Graph bolgesini degistirmek icin:
+
+```powershell
+$env:GRAPH_PLACE="Karabuk Merkez, Karabuk, Turkiye"
 ```
