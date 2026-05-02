@@ -29,6 +29,7 @@ HUB_CARGO_GEN_MAX = int(os.getenv("HUB_CARGO_GEN_MAX", "4"))
 EOD_TIME_RATIO = 0.20       # last 20 % of shift = "time short"
 MIN_RELOAD_LOAD_RATIO = 0.30  # < 30 % capacity filled = "load small"
 SIM_DAY_START_HOUR = 10     # display offset: sim t=0 → 10:00
+HUB_LOAD_SECONDS_PER_CARGO = int(os.getenv("HUB_LOAD_SECONDS_PER_CARGO", "30"))  # loading wait per cargo
 
 _hub_rng: random.Random = random.Random()
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -151,6 +152,7 @@ class Courier:
         "moving",
         "servicing_delivery",
         "servicing_return",
+        "loading",
         "done",
     ] = "idle"
     active_stop_id: str | None = None
@@ -402,6 +404,21 @@ def try_reload_from_hub(courier: Courier) -> None:
     if len(route) > 1:
         route = nearest_neighbor_sort(hub_node, route)
 
+    # Loading wait at hub before departure (30 s per cargo)
+    load_wait = len(assigned) * HUB_LOAD_SECONDS_PER_CARGO
+    route.insert(
+        0,
+        Stop(
+            id=str(uuid4()),
+            kind="hub",
+            label=f"Yukleniyor ({len(assigned)} kargo)",
+            lat=hub_lat,
+            lon=hub_lon,
+            node=hub_node,
+            service_seconds=load_wait,
+        ),
+    )
+
     route.append(
         Stop(
             id=str(uuid4()),
@@ -419,7 +436,7 @@ def try_reload_from_hub(courier: Courier) -> None:
     rebuild_courier_path(courier)
 
     state.messages.append(
-        f"{courier.name} hub'dan {load} desi ({len(assigned)} kargo) ile tekrar yola cikti"
+        f"{courier.name} hub'da {load_wait} sn yukleniyor — {load} desi ({len(assigned)} kargo)"
     )
 
 
@@ -738,6 +755,12 @@ def complete_service(courier: Courier) -> None:
     elif stop.kind == "return":
         courier.current_load = min(courier.capacity_desi, courier.current_load + stop.desi)
         state.messages.append(f"{courier.name} {stop.desi} desi iade aldi")
+    elif stop.kind == "hub":
+        if courier.current_load > 0:
+            state.messages.append(
+                f"{courier.name} hub'a {courier.current_load} desi iade boslatti"
+            )
+        courier.current_load = 0
         if not any(job.id == stop.id for job in state.completed_returns):
             state.completed_returns.append(
                 ReturnJob(
@@ -764,9 +787,12 @@ def complete_service(courier: Courier) -> None:
 def start_service(courier: Courier, stop: Stop) -> None:
     courier.active_stop_id = stop.id
     courier.service_remaining_seconds = float(stop.service_seconds)
-    courier.movement_status = (
-        "servicing_return" if stop.kind == "return" else "servicing_delivery"
-    )
+    if stop.kind == "return":
+        courier.movement_status = "servicing_return"
+    elif stop.kind == "hub" and stop.service_seconds > 0:
+        courier.movement_status = "loading"
+    else:
+        courier.movement_status = "servicing_delivery"
 
 
 def advance_courier(courier: Courier, elapsed_seconds: float) -> None:
@@ -774,7 +800,7 @@ def advance_courier(courier: Courier, elapsed_seconds: float) -> None:
     speed_mps = SIM_SPEED_KMH * 1000 / 3600
 
     while remaining_seconds > 0:
-        if courier.movement_status in {"servicing_delivery", "servicing_return"}:
+        if courier.movement_status in {"servicing_delivery", "servicing_return", "loading"}:
             consumed = min(remaining_seconds, courier.service_remaining_seconds)
             courier.service_remaining_seconds -= consumed
             remaining_seconds -= consumed

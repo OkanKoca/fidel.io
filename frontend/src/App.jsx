@@ -49,6 +49,7 @@ function statusLabel(status) {
     moving: 'yolda',
     servicing_delivery: 'teslimat',
     servicing_return: 'iade alma',
+    loading: 'yukleniyor',
     done: 'tamamlandi',
   };
   return labels[status] ?? status;
