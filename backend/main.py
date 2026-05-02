@@ -20,6 +20,17 @@ KARABUK_CENTER = {"lat": 41.1956, "lon": 32.6227}
 SPATIAL_TRIGGER_KM = float(os.getenv("SPATIAL_TRIGGER_KM", "2.0"))
 SIM_SPEED_KMH = float(os.getenv("SIM_SPEED_KMH", "70"))
 GRAPH_PLACE = os.getenv("GRAPH_PLACE", "Karabuk Merkez, Karabuk, Turkiye")
+
+# Working-hours & hub cargo generation
+WORKING_HOURS_END_S = float(os.getenv("WORKING_HOURS_END_S", "28800"))   # 8 h → 10:00–18:00
+HUB_CARGO_GEN_INTERVAL_S = float(os.getenv("HUB_CARGO_GEN_INTERVAL_S", "120"))  # every 2 sim-min
+HUB_CARGO_GEN_MIN = int(os.getenv("HUB_CARGO_GEN_MIN", "1"))
+HUB_CARGO_GEN_MAX = int(os.getenv("HUB_CARGO_GEN_MAX", "4"))
+EOD_TIME_RATIO = 0.20       # last 20 % of shift = "time short"
+MIN_RELOAD_LOAD_RATIO = 0.30  # < 30 % capacity filled = "load small"
+SIM_DAY_START_HOUR = 10     # display offset: sim t=0 → 10:00
+
+_hub_rng: random.Random = random.Random()
 BACKEND_DIR = Path(__file__).resolve().parent
 GRAPH_CACHE_PATH = Path(
     os.getenv("GRAPH_CACHE_PATH", str(BACKEND_DIR / "data" / "karabuk_drive.graphml"))
@@ -55,12 +66,22 @@ class VehicleInput(BaseModel):
 class StartRequest(BaseModel):
     vehicles: list[VehicleInput] = Field(min_length=1, max_length=12)
     seed: int = 42
+    cargos: list[CargoInput] = Field(default_factory=list)
     min_deliveries: int = Field(default=5, ge=1, le=12)
     max_deliveries: int = Field(default=7, ge=1, le=15)
+    working_hours_end_s: float = Field(default=WORKING_HOURS_END_S, gt=0, le=86400)
 
 
 class ReturnRequest(BaseModel):
     desi: int = Field(gt=0, le=500)
+    lat: float | None = Field(default=None, ge=-90, le=90)
+    lon: float | None = Field(default=None, ge=-180, le=180)
+
+
+class CargoInput(BaseModel):
+    id: str | None = None
+    desi: int = Field(gt=0, le=500)
+    label: str | None = None
     lat: float | None = Field(default=None, ge=-90, le=90)
     lon: float | None = Field(default=None, ge=-180, le=180)
 
@@ -80,6 +101,19 @@ class Stop:
     desi: int = 0
     service_seconds: int = 0
     status: Literal["pending", "done"] = "pending"
+    cargo_id: str | None = None
+
+
+@dataclass
+class HubCargo:
+    id: str
+    desi: int
+    label: str
+    lat: float
+    lon: float
+    node: int
+    status: Literal["waiting", "assigned"] = "waiting"
+    arrived_at: float = 0.0
 
 
 @dataclass
@@ -136,6 +170,11 @@ class SimState:
     completed_returns: list[ReturnJob] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)
     speed_multiplier: float = 2.0
+    unassigned_cargos: list[dict] = field(default_factory=list)
+    hub_cargo_pool: list[HubCargo] = field(default_factory=list)
+    sim_elapsed_seconds: float = 0.0
+    working_hours_end_s: float = WORKING_HOURS_END_S
+    last_hub_cargo_gen_at: float = -WORKING_HOURS_END_S  # triggers first gen after one interval
 
 
 state = SimState()
@@ -160,6 +199,228 @@ def haversine_km(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> floa
         + math.cos(lat1) * math.cos(lat2) * math.sin(d_lon / 2) ** 2
     )
     return 2 * radius * math.asin(math.sqrt(h))
+
+
+def assign_cargos_geographic(
+    cargo_nodes: list[tuple[CargoInput, int]],
+    vehicles: list[VehicleInput],
+    hub_node: int,
+) -> tuple[list[list[tuple[CargoInput, int]]], list[tuple[CargoInput, int]]]:
+    """
+    Geographic-aware, capacity-constrained cargo assignment.
+
+    Algorithm:
+    - Sort cargos descending by desi (FFD-style capacity guard so large items
+      are placed first, reducing fragmentation).
+    - Each vehicle maintains a frontier node that starts at the hub.
+    - Each cargo is assigned to the vehicle whose frontier is geographically
+      closest (shortest network path), provided capacity allows.
+    - After assignment the frontier advances to that cargo's node, so
+      subsequent cargos naturally cluster in the same geographic zone.
+
+    Result: vehicles receive geographically cohesive cargo groups rather
+    than arbitrary capacity-fill groups, which lowers total travel distance.
+    """
+    sorted_items = sorted(cargo_nodes, key=lambda x: x[0].desi, reverse=True)
+    loads = [0] * len(vehicles)
+    assignments: list[list[tuple[CargoInput, int]]] = [[] for _ in vehicles]
+    frontiers = [hub_node] * len(vehicles)
+    unassigned: list[tuple[CargoInput, int]] = []
+
+    for cargo, node in sorted_items:
+        best_i: int | None = None
+        best_cost = float("inf")
+        for i, vehicle in enumerate(vehicles):
+            if loads[i] + cargo.desi > vehicle.capacity_desi:
+                continue
+            cost = shortest_path_length_m(frontiers[i], node)
+            if cost < best_cost:
+                best_cost = cost
+                best_i = i
+        if best_i is None:
+            unassigned.append((cargo, node))
+        else:
+            assignments[best_i].append((cargo, node))
+            loads[best_i] += cargo.desi
+            frontiers[best_i] = node
+
+    return assignments, unassigned
+
+
+def nearest_neighbor_sort(origin_node: int, stops: list[Stop]) -> list[Stop]:
+    """Greedy nearest-neighbor ordering starting from origin_node."""
+    if len(stops) <= 1:
+        return stops
+    remaining = list(stops)
+    ordered: list[Stop] = []
+    current = origin_node
+    while remaining:
+        closest = min(remaining, key=lambda s: shortest_path_length_m(current, s.node))
+        ordered.append(closest)
+        remaining.remove(closest)
+        current = closest.node
+    return ordered
+
+
+def format_sim_clock(elapsed_s: float) -> str:
+    total_m = int(elapsed_s / 60)
+    h = SIM_DAY_START_HOUR + total_m // 60
+    m = total_m % 60
+    return f"{h:02d}:{m:02d}"
+
+
+def serialize_hub_cargo(cargo: HubCargo) -> dict:
+    return {
+        "id": cargo.id,
+        "desi": cargo.desi,
+        "label": cargo.label,
+        "lat": cargo.lat,
+        "lon": cargo.lon,
+        "node": cargo.node,
+        "status": cargo.status,
+        "arrived_at": cargo.arrived_at,
+    }
+
+
+def auto_generate_hub_cargos() -> None:
+    """Spawn a random batch of delivery cargos into the hub pool."""
+    occupied = occupied_stop_nodes()
+    count = _hub_rng.randint(HUB_CARGO_GEN_MIN, HUB_CARGO_GEN_MAX)
+    gen_idx = len(state.hub_cargo_pool)
+    new_labels: list[str] = []
+    for i in range(count):
+        node = random_graph_node(_hub_rng, occupied)
+        occupied.add(node)
+        lat, lon = node_lat_lon(node)
+        desi = _hub_rng.randint(5, 40)
+        label = f"Hub Kargo {gen_idx + i + 1}"
+        state.hub_cargo_pool.append(
+            HubCargo(
+                id=str(uuid4()),
+                desi=desi,
+                label=label,
+                lat=lat,
+                lon=lon,
+                node=node,
+                arrived_at=state.sim_elapsed_seconds,
+            )
+        )
+        new_labels.append(f"{label} ({desi} desi)")
+    state.messages.append(f"Hub'a {count} yeni kargo geldi: {', '.join(new_labels)}")
+    state.last_hub_cargo_gen_at = state.sim_elapsed_seconds
+
+
+def should_reload(courier: Courier, waiting: list[HubCargo]) -> bool:
+    """
+    Decide whether a returning vehicle should make another trip.
+
+    Returns False if BOTH conditions hold simultaneously:
+      - Time is short  : remaining shift < EOD_TIME_RATIO of total shift
+      - Load is small  : assignable desi < MIN_RELOAD_LOAD_RATIO of capacity
+
+    When only one condition holds (plenty of time OR plenty of cargo) the
+    vehicle still goes — e.g. end-of-day but a large batch justifies the trip.
+    """
+    remaining = state.working_hours_end_s - state.sim_elapsed_seconds
+    if remaining <= 0 or not waiting:
+        return False
+
+    fittable_desi = sum(c.desi for c in waiting if c.desi <= courier.capacity_desi)
+    if fittable_desi == 0:
+        return False
+
+    load_ratio = min(1.0, fittable_desi / courier.capacity_desi)
+    time_ratio = remaining / state.working_hours_end_s   # 1 = start, 0 = EOD
+
+    time_short = time_ratio < EOD_TIME_RATIO
+    load_small = load_ratio < MIN_RELOAD_LOAD_RATIO
+
+    if time_short and load_small:
+        state.messages.append(
+            f"{courier.name}: mesai bitimine yakin ve kargo az — yeni tur yapilmadi"
+        )
+        return False
+    return True
+
+
+def try_reload_from_hub(courier: Courier) -> None:
+    """
+    Greedily assign waiting hub cargos to a vehicle that just returned.
+    Uses nearest-to-current-frontier selection (geographic fill) so the
+    new route stays geographically cohesive, then applies nearest-neighbor
+    sequencing before dispatch.
+    """
+    waiting = [c for c in state.hub_cargo_pool if c.status == "waiting"]
+    if not should_reload(courier, waiting):
+        return
+
+    # Geographic greedy fill — frontier starts at hub (courier.node)
+    load = 0
+    assigned: list[HubCargo] = []
+    current_node = courier.node
+    remaining = list(waiting)
+
+    while remaining:
+        best: tuple[float, HubCargo] | None = None
+        for c in remaining:
+            if load + c.desi > courier.capacity_desi:
+                continue
+            cost = shortest_path_length_m(current_node, c.node)
+            if best is None or cost < best[0]:
+                best = (cost, c)
+        if best is None:
+            break
+        _, chosen = best
+        assigned.append(chosen)
+        load += chosen.desi
+        current_node = chosen.node
+        remaining.remove(chosen)
+
+    if not assigned:
+        return
+
+    hub_node = courier.node
+    hub_lat, hub_lon = node_lat_lon(hub_node)
+
+    route: list[Stop] = []
+    for cargo in assigned:
+        route.append(
+            Stop(
+                id=str(uuid4()),
+                kind="delivery",
+                label=cargo.label,
+                lat=cargo.lat,
+                lon=cargo.lon,
+                node=cargo.node,
+                desi=cargo.desi,
+                service_seconds=3,
+                cargo_id=cargo.id,
+            )
+        )
+        cargo.status = "assigned"
+
+    if len(route) > 1:
+        route = nearest_neighbor_sort(hub_node, route)
+
+    route.append(
+        Stop(
+            id=str(uuid4()),
+            kind="hub",
+            label="Hub donus",
+            lat=hub_lat,
+            lon=hub_lon,
+            node=hub_node,
+            service_seconds=0,
+        )
+    )
+
+    courier.route = route
+    courier.current_load = load
+    rebuild_courier_path(courier)
+
+    state.messages.append(
+        f"{courier.name} hub'dan {load} desi ({len(assigned)} kargo) ile tekrar yola cikti"
+    )
 
 
 def get_graph() -> nx.MultiDiGraph:
@@ -495,6 +756,10 @@ def complete_service(courier: Courier) -> None:
     courier.service_remaining_seconds = 0.0
     rebuild_courier_path(courier)
 
+    # Vehicle just returned to hub with no remaining deliveries → attempt reload
+    if stop is not None and stop.kind == "hub" and courier.movement_status == "done":
+        try_reload_from_hub(courier)
+
 
 def start_service(courier: Courier, stop: Stop) -> None:
     courier.active_stop_id = stop.id
@@ -575,6 +840,13 @@ async def advance_running_state() -> None:
         return
 
     state.tick += 1
+    state.sim_elapsed_seconds += elapsed
+
+    # Auto-generate hub cargos on interval, only during working hours
+    if (state.sim_elapsed_seconds < state.working_hours_end_s
+            and state.sim_elapsed_seconds - state.last_hub_cargo_gen_at >= HUB_CARGO_GEN_INTERVAL_S):
+        auto_generate_hub_cargos()
+
     for courier in state.couriers:
         advance_courier(courier, elapsed)
 
@@ -693,10 +965,13 @@ def defer_pending_returns() -> None:
 
 async def evaluate_return_pool() -> None:
     state.pending_returns.sort(key=lambda job: (not job.deferred, job.created_at))
+    assigned_jobs: list[ReturnJob] = []
     for job in list(state.pending_returns):
-        assigned = await try_assign_return(job)
-        if assigned:
-            state.pending_returns.remove(job)
+        if await try_assign_return(job):
+            assigned_jobs.append(job)
+    if assigned_jobs:
+        assigned_ids = {j.id for j in assigned_jobs}
+        state.pending_returns = [j for j in state.pending_returns if j.id not in assigned_ids]
     defer_pending_returns()
 
 
@@ -718,6 +993,7 @@ def serialize_stop(stop: Stop) -> dict:
         "desi": stop.desi,
         "service_seconds": stop.service_seconds,
         "status": stop.status,
+        "cargo_id": stop.cargo_id,
     }
 
 
@@ -743,6 +1019,7 @@ def occupied_stop_nodes() -> set[int]:
         nodes.update(stop.node for stop in courier.route)
     nodes.update(job.node for job in state.pending_returns)
     nodes.update(job.node for job in state.completed_returns)
+    nodes.update(cargo.node for cargo in state.hub_cargo_pool)
     return nodes
 
 
@@ -778,6 +1055,12 @@ def state_response() -> dict:
         ],
         "pending_returns": [serialize_return(job) for job in state.pending_returns],
         "completed_returns": [serialize_return(job) for job in state.completed_returns],
+        "unassigned_cargos": state.unassigned_cargos,
+        "hub_cargo_pool": [serialize_hub_cargo(c) for c in state.hub_cargo_pool],
+        "sim_elapsed_seconds": state.sim_elapsed_seconds,
+        "working_hours_end_s": state.working_hours_end_s,
+        "sim_clock": format_sim_clock(state.sim_elapsed_seconds),
+        "end_clock": format_sim_clock(state.working_hours_end_s),
     }
 
 
@@ -792,55 +1075,144 @@ async def start_simulation(request: StartRequest) -> dict:
     ]
     get_graph()
     rng = random.Random(request.seed)
+    _hub_rng.seed(request.seed + 9999)  # separate stream so hub gen is independent
     used_points: set[int] = set()
     colors = ["#2563eb", "#f97316", "#16a34a", "#db2777", "#7c3aed", "#0891b2"]
     hub_node = nearest_node(KARABUK_CENTER["lat"], KARABUK_CENTER["lon"])
     hub_lat, hub_lon = node_lat_lon(hub_node)
     couriers: list[Courier] = []
+    unassigned_cargo_dicts: list[dict] = []
 
-    for index, vehicle in enumerate(request.vehicles):
-        stop_count = rng.randint(request.min_deliveries, request.max_deliveries)
-        desi_values = split_delivery_load(rng, vehicle.capacity_desi, stop_count)
-        route = []
-        for stop_index in range(stop_count):
-            node = random_graph_node(rng, used_points)
-            lat, lon = node_lat_lon(node)
+    if request.cargos:
+        # Step 1 — Resolve every cargo to an OSM node before assignment.
+        # Known lat/lon (future real-address support) snapped to nearest node;
+        # otherwise a random graph node is drawn from the shared pool so
+        # cargo locations don't overlap each other or existing stops.
+        cargo_nodes: list[tuple[CargoInput, int]] = []
+        for cargo in request.cargos:
+            if cargo.lat is not None and cargo.lon is not None:
+                node = nearest_node(cargo.lat, cargo.lon)
+            else:
+                node = random_graph_node(rng, used_points)
+            cargo_nodes.append((cargo, node))
+
+        # Step 2 — Geographic-aware capacity assignment.
+        # Each vehicle's frontier starts at the hub; each cargo goes to the
+        # vehicle whose frontier is closest (network distance), capacity permitting.
+        # This naturally forms geographic clusters instead of arbitrary desi-fill.
+        vehicle_assignments, unassigned_pairs = assign_cargos_geographic(
+            cargo_nodes, request.vehicles, hub_node
+        )
+        unassigned_cargo_dicts = [
+            {"id": c.id, "desi": c.desi, "label": c.label or c.id or "?"}
+            for c, _ in unassigned_pairs
+        ]
+
+        # Step 3 — Build per-vehicle routes and optimise delivery sequence.
+        for index, vehicle in enumerate(request.vehicles):
+            assigned_pairs = vehicle_assignments[index]
+            route: list[Stop] = []
+
+            for cargo, node in assigned_pairs:
+                lat, lon = node_lat_lon(node)
+                route.append(
+                    Stop(
+                        id=str(uuid4()),
+                        kind="delivery",
+                        label=cargo.label or f"Kargo {index + 1}-{len(route) + 1}",
+                        lat=lat,
+                        lon=lon,
+                        node=node,
+                        desi=cargo.desi,
+                        service_seconds=3,
+                        cargo_id=cargo.id,
+                    )
+                )
+
+            # Nearest-neighbor sort within each vehicle's zone.
+            # Geographic assignment clusters cargos per vehicle;
+            # this pass then minimises the in-zone travel sequence.
+            if len(route) > 1:
+                route = nearest_neighbor_sort(hub_node, route)
+
             route.append(
                 Stop(
                     id=str(uuid4()),
-                    kind="delivery",
-                    label=f"Teslimat {stop_index + 1}",
-                    lat=lat,
-                    lon=lon,
-                    node=node,
-                    desi=desi_values[stop_index],
-                    service_seconds=3,
+                    kind="hub",
+                    label="Hub donus",
+                    lat=hub_lat,
+                    lon=hub_lon,
+                    node=hub_node,
+                    service_seconds=0,
                 )
             )
-        route.append(
-            Stop(
-                id=str(uuid4()),
-                kind="hub",
-                label="Hub donus",
+
+            total_load = sum(c.desi for c, _ in assigned_pairs)
+            courier = Courier(
+                id=vehicle.id or f"courier-{index + 1}",
+                name=f"Arac {index + 1}",
+                capacity_desi=vehicle.capacity_desi,
+                current_load=total_load,
                 lat=hub_lat,
                 lon=hub_lon,
                 node=hub_node,
-                service_seconds=0,
+                route=route,
+                color=colors[index % len(colors)],
             )
+            rebuild_courier_path(courier)
+            couriers.append(courier)
+
+    else:
+        # Fallback: random delivery generation (backward-compatible)
+        for index, vehicle in enumerate(request.vehicles):
+            stop_count = rng.randint(request.min_deliveries, request.max_deliveries)
+            desi_values = split_delivery_load(rng, vehicle.capacity_desi, stop_count)
+            route = []
+            for stop_index in range(stop_count):
+                node = random_graph_node(rng, used_points)
+                lat, lon = node_lat_lon(node)
+                route.append(
+                    Stop(
+                        id=str(uuid4()),
+                        kind="delivery",
+                        label=f"Teslimat {stop_index + 1}",
+                        lat=lat,
+                        lon=lon,
+                        node=node,
+                        desi=desi_values[stop_index],
+                        service_seconds=3,
+                    )
+                )
+            route.append(
+                Stop(
+                    id=str(uuid4()),
+                    kind="hub",
+                    label="Hub donus",
+                    lat=hub_lat,
+                    lon=hub_lon,
+                    node=hub_node,
+                    service_seconds=0,
+                )
+            )
+            courier = Courier(
+                id=vehicle.id or f"courier-{index + 1}",
+                name=f"Arac {index + 1}",
+                capacity_desi=vehicle.capacity_desi,
+                current_load=sum(desi_values),
+                lat=hub_lat,
+                lon=hub_lon,
+                node=hub_node,
+                route=route,
+                color=colors[index % len(colors)],
+            )
+            rebuild_courier_path(courier)
+            couriers.append(courier)
+
+    messages = [f"Simulasyon {len(couriers)} aracla baslatildi"]
+    if unassigned_cargo_dicts:
+        messages.append(
+            f"{len(unassigned_cargo_dicts)} kargo kapasiteye sigmadi ve atanamadi"
         )
-        courier = Courier(
-            id=vehicle.id or f"courier-{index + 1}",
-            name=f"Arac {index + 1}",
-            capacity_desi=vehicle.capacity_desi,
-            current_load=sum(desi_values),
-            lat=hub_lat,
-            lon=hub_lon,
-            node=hub_node,
-            route=route,
-            color=colors[index % len(colors)],
-        )
-        rebuild_courier_path(courier)
-        couriers.append(courier)
 
     state = SimState(
         started=True,
@@ -849,7 +1221,11 @@ async def start_simulation(request: StartRequest) -> dict:
         couriers=couriers,
         pending_returns=deferred_returns,
         speed_multiplier=state.speed_multiplier,
-        messages=[f"Simulasyon {len(couriers)} aracla baslatildi"],
+        messages=messages,
+        unassigned_cargos=unassigned_cargo_dicts,
+        working_hours_end_s=request.working_hours_end_s,
+        sim_elapsed_seconds=0.0,
+        last_hub_cargo_gen_at=-HUB_CARGO_GEN_INTERVAL_S,  # first gen fires after one interval
     )
     if deferred_returns:
         state.messages.append(f"{len(deferred_returns)} ertelenen iade oncelikli havuza tasindi")

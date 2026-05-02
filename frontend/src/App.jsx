@@ -1,7 +1,21 @@
 import { useEffect, useMemo, useState } from 'react';
 import { MapContainer, Marker, Polyline, Popup, TileLayer, CircleMarker } from 'react-leaflet';
 import L from 'leaflet';
-import { PackageCheck, PackagePlus, Pause, Play, RotateCcw, StepForward, Truck, Timer, MapPin } from 'lucide-react';
+import {
+  PackageCheck,
+  PackagePlus,
+  Pause,
+  Play,
+  RotateCcw,
+  StepForward,
+  Truck,
+  Timer,
+  MapPin,
+  Wifi,
+  WifiOff,
+  Building2,
+  Clock,
+} from 'lucide-react';
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000';
 const CENTER = [41.1956, 32.6227];
@@ -32,8 +46,8 @@ function statusLabel(status) {
   const labels = {
     idle: 'hazir',
     moving: 'yolda',
-    servicing_delivery: 'teslimat bekleme',
-    servicing_return: 'iade bekleme',
+    servicing_delivery: 'teslimat',
+    servicing_return: 'iade alma',
     done: 'tamamlandi',
   };
   return labels[status] ?? status;
@@ -41,12 +55,9 @@ function statusLabel(status) {
 
 function loadBreakdown(courier) {
   const deliveryLoad = courier.route
-    .filter((stop) => stop.kind === 'delivery' && stop.status === 'pending')
-    .reduce((total, stop) => total + stop.desi, 0);
-  return {
-    deliveryLoad,
-    returnLoad: Math.max(0, courier.current_load - deliveryLoad),
-  };
+    .filter((s) => s.kind === 'delivery' && s.status === 'pending')
+    .reduce((t, s) => t + s.desi, 0);
+  return { deliveryLoad, returnLoad: Math.max(0, courier.current_load - deliveryLoad) };
 }
 
 export default function App() {
@@ -56,14 +67,16 @@ export default function App() {
   const [capacities, setCapacities] = useState('100,100,100');
   const [returnDesi, setReturnDesi] = useState(15);
   const [busy, setBusy] = useState(false);
+  const [connected, setConnected] = useState(false);
+  const [endHour, setEndHour] = useState(18);
 
   const vehicles = useMemo(
     () =>
       capacities
         .split(',')
-        .map((item) => Number(item.trim()))
-        .filter((item) => Number.isFinite(item) && item > 0)
-        .map((capacity, index) => ({ id: `vehicle-${index + 1}`, capacity_desi: capacity })),
+        .map((v) => Number(v.trim()))
+        .filter((v) => Number.isFinite(v) && v > 0)
+        .map((capacity, i) => ({ id: `vehicle-${i + 1}`, capacity_desi: capacity })),
     [capacities],
   );
 
@@ -72,6 +85,7 @@ export default function App() {
     setError('');
     try {
       setState(await action());
+      setConnected(true);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -80,54 +94,114 @@ export default function App() {
   }
 
   useEffect(() => {
-    const timer = setInterval(async () => {
+    const t = setInterval(async () => {
       try {
         setState(await api('/api/sim/state'));
+        setConnected(true);
       } catch {
-        // Backend may not be running yet; keep the current screen stable.
+        setConnected(false);
       }
     }, 1000);
-    return () => clearInterval(timer);
+    return () => clearInterval(t);
   }, []);
 
   const started = Boolean(state?.started);
   const running = Boolean(state?.running);
 
+  const workingHoursEndS = Math.max(1, (endHour - 10) * 3600);
+  const totalCapacity = vehicles.reduce((s, v) => s + v.capacity_desi, 0);
+  const simElapsed = state?.sim_elapsed_seconds ?? 0;
+  const simEnd = state?.working_hours_end_s ?? workingHoursEndS;
+  const simProgress = simEnd > 0 ? Math.min(1, simElapsed / simEnd) : 0;
+  const nearEod = simProgress > 1 - 0.2;
+  const hubWaiting = state?.hub_cargo_pool?.filter((c) => c.status === 'waiting') ?? [];
+  const hubAssigned = state?.hub_cargo_pool?.filter((c) => c.status === 'assigned') ?? [];
+
   return (
     <main className="shell">
+      {/* LEFT PANEL */}
       <aside className="panel left-panel">
         <header>
           <div>
-            <p>Karabuk Merkez - OSM graph</p>
+            <p>Karabuk Merkez — OSM graph</p>
             <h1>Dinamik Kargo Rotalama</h1>
           </div>
-          <span className={`status ${running ? 'live' : ''}`}>{running ? 'Canli' : started ? 'Duraklatildi' : 'Hazir'}</span>
+          <div className="header-badges">
+            <span className={`status ${running ? 'live' : ''}`}>
+              {running ? 'Canli' : started ? 'Duraklatildi' : 'Hazir'}
+            </span>
+            <span className={`conn-badge ${connected ? 'conn-ok' : 'conn-fail'}`}>
+              {connected ? <Wifi size={11} /> : <WifiOff size={11} />}
+              {connected ? 'Bagli' : 'Baglanti yok'}
+            </span>
+          </div>
         </header>
 
         <section className="meta-row">
           <span>Tick {state?.tick ?? 0}</span>
-          <span>Arac hizi {state?.speed_kmh ?? 70} km/s</span>
+          <span>{state?.speed_kmh ?? 70} km/s</span>
           <span>Sim {state?.speed_multiplier ?? 2}x</span>
+          <span>{totalCapacity} desi toplam kapasite</span>
           <span>{state?.graph_source ?? 'graph bekleniyor'}</span>
         </section>
 
+        {/* Simulated working-hours clock */}
+        <section className="work-hours-section">
+          <div className="sim-clock-display">
+            <Clock size={15} />
+            <span className={`sim-clock-now ${nearEod ? 'wh-eod-text' : ''}`}>
+              {state?.sim_clock ?? '10:00'}
+            </span>
+            <span className="sim-clock-sep">—</span>
+            <span className="sim-clock-end">{state?.end_clock ?? `${endHour}:00`}</span>
+            {running && <span className="sim-running-dot" title="Calisiyor" />}
+          </div>
+          <div className="work-hours-row">
+            <span className="wh-label">10:00</span>
+            <div className="work-hours-bar">
+              <span
+                className={`wh-fill ${nearEod ? 'wh-eod' : ''}`}
+                style={{ width: `${Math.max(0, simProgress * 100)}%` }}
+              />
+            </div>
+            <span className="wh-label">{state?.end_clock ?? `${endHour}:00`}</span>
+          </div>
+          {nearEod && <p className="cap-warning">Mesai bitisine yaklasiliyor.</p>}
+        </section>
+
+        {/* Vehicle + seed config */}
         <section className="controls">
           <label>
             Arac desileri
-            <input value={capacities} onChange={(event) => setCapacities(event.target.value)} />
+            <input value={capacities} onChange={(e) => setCapacities(e.target.value)} />
           </label>
           <label>
             Seed
-            <input type="number" value={seed} onChange={(event) => setSeed(Number(event.target.value))} />
+            <input type="number" value={seed} onChange={(e) => setSeed(Number(e.target.value))} />
           </label>
+          <label>
+            Mesai bitis
+            <input
+              type="number"
+              value={endHour}
+              min={11}
+              max={24}
+              onChange={(e) => setEndHour(Number(e.target.value))}
+            />
+          </label>
+        </section>
+
+        {/* Start */}
+        <section style={{ display: 'grid' }}>
           <button
             onClick={() =>
-              run(() =>
-                api('/api/sim/start', {
+              run(async () => {
+                await api('/api/sim/start', {
                   method: 'POST',
-                  body: JSON.stringify({ seed, vehicles }),
-                }),
-              )
+                  body: JSON.stringify({ seed, vehicles, working_hours_end_s: workingHoursEndS }),
+                });
+                return api('/api/sim/run', { method: 'POST' });
+              })
             }
             disabled={busy || vehicles.length === 0}
           >
@@ -135,6 +209,7 @@ export default function App() {
           </button>
         </section>
 
+        {/* Playback controls */}
         <section className="controls run-controls">
           <button onClick={() => run(() => api('/api/sim/run', { method: 'POST' }))} disabled={busy || !started || running}>
             <Play size={18} /> Calistir
@@ -148,63 +223,76 @@ export default function App() {
         </section>
 
         <section className="speed-control">
-          {SPEED_OPTIONS.map((multiplier) => (
+          {SPEED_OPTIONS.map((m) => (
             <button
-              key={multiplier}
-              className={state?.speed_multiplier === multiplier ? 'active' : ''}
-              onClick={() =>
-                run(() =>
-                  api('/api/sim/speed', {
-                    method: 'POST',
-                    body: JSON.stringify({ multiplier }),
-                  }),
-                )
-              }
+              key={m}
+              className={state?.speed_multiplier === m ? 'active' : ''}
+              onClick={() => run(() => api('/api/sim/speed', { method: 'POST', body: JSON.stringify({ multiplier: m }) }))}
               disabled={busy}
             >
-              {multiplier}x
+              {m}x
             </button>
           ))}
         </section>
 
         {error && <div className="error">{error}</div>}
 
+        {/* Vehicle cards */}
         <section>
           <h2>
             <Truck size={18} /> Araclar
           </h2>
           <div className="cards">
             {state?.couriers?.map((courier) => {
-              const loadPercent = Math.round((courier.current_load / courier.capacity_desi) * 100);
+              const pct = Math.round((courier.current_load / courier.capacity_desi) * 100);
               const { deliveryLoad, returnLoad } = loadBreakdown(courier);
+              const deliveries = courier.route.filter((s) => s.kind === 'delivery');
+              const pending = courier.route.filter((s) => s.status === 'pending' && s.kind !== 'hub').length;
               return (
                 <article className="card" key={courier.id}>
                   <div className="card-title">
                     <span className="dot" style={{ background: courier.color }} />
                     <strong>{courier.name}</strong>
-                    <span>{courier.current_load}/{courier.capacity_desi} desi</span>
+                    <span>
+                      {courier.current_load}/{courier.capacity_desi} desi
+                    </span>
                   </div>
                   <div className="bar">
-                    <span style={{ width: `${Math.min(100, loadPercent)}%`, background: courier.color }} />
+                    <span style={{ width: `${Math.min(100, pct)}%`, background: courier.color }} />
                   </div>
                   <div className="load-split">
                     <span>Teslimat {deliveryLoad} desi</span>
                     <span>Iade {returnLoad} desi</span>
                   </div>
-                  <p>{courier.route.filter((stop) => stop.status === 'pending').length} bekleyen durak</p>
+                  <p>{pending} bekleyen durak</p>
                   <p>
                     {statusLabel(courier.movement_status)}
-                    {courier.service_remaining_seconds > 0 ? ` - ${courier.service_remaining_seconds} sn` : ''}
+                    {courier.service_remaining_seconds > 0 ? ` — ${courier.service_remaining_seconds} sn` : ''}
                   </p>
                   {courier.route_error && <p className="route-error">{courier.route_error}</p>}
+
+                  {/* Cargo manifest */}
+                  {deliveries.length > 0 && (
+                    <div className="cargo-manifest">
+                      <div className="manifest-header">Yukleme Sirasi</div>
+                      {deliveries.map((stop, idx) => (
+                        <div key={stop.id} className={`manifest-entry ${stop.status}`}>
+                          <span className="manifest-order">{idx + 1}</span>
+                          <span className="manifest-label">{stop.label}</span>
+                          <span className="manifest-desi">{stop.desi} desi</span>
+                          <span className="manifest-check">{stop.status === 'done' ? '✓' : '○'}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </article>
               );
             })}
           </div>
         </section>
-
       </aside>
 
+      {/* MAP */}
       <section className="map-wrap">
         <MapContainer center={CENTER} zoom={13} scrollWheelZoom className="map">
           <TileLayer
@@ -214,15 +302,9 @@ export default function App() {
           {state?.couriers?.map((courier) =>
             courier.polyline?.length ? (
               <Polyline
-                key={`${courier.id}-route-shadow`}
+                key={`${courier.id}-shadow`}
                 positions={courier.polyline}
-                pathOptions={{
-                  color: courier.color,
-                  weight: 12,
-                  opacity: 0.18,
-                  lineCap: 'round',
-                  lineJoin: 'round',
-                }}
+                pathOptions={{ color: courier.color, weight: 12, opacity: 0.18, lineCap: 'round', lineJoin: 'round' }}
               />
             ) : null,
           )}
@@ -243,11 +325,7 @@ export default function App() {
             ) : null,
           )}
           {state?.couriers?.map((courier) => (
-            <Marker
-              key={courier.id}
-              position={[courier.lat, courier.lon]}
-              icon={markerIcon(courier.color, courier.movement_status)}
-            >
+            <Marker key={courier.id} position={[courier.lat, courier.lon]} icon={markerIcon(courier.color, courier.movement_status)}>
               <Popup>
                 <strong>{courier.name}</strong>
                 <br />
@@ -271,7 +349,13 @@ export default function App() {
                 <Popup>
                   <strong>{stop.label}</strong>
                   <br />
-                  {stop.kind} - {stop.desi} desi - {stop.status}
+                  {stop.kind} — {stop.desi} desi — {stop.status}
+                  {stop.cargo_id && (
+                    <>
+                      <br />
+                      <small>{stop.cargo_id}</small>
+                    </>
+                  )}
                 </Popup>
               </CircleMarker>
             )),
@@ -297,25 +381,44 @@ export default function App() {
         </MapContainer>
       </section>
 
+      {/* RIGHT PANEL */}
       <aside className="panel right-panel">
         <section className="controls two">
           <label>
             Iade desi
-            <input type="number" value={returnDesi} onChange={(event) => setReturnDesi(Number(event.target.value))} />
+            <input type="number" value={returnDesi} onChange={(e) => setReturnDesi(Number(e.target.value))} />
           </label>
           <button
             onClick={() =>
-              run(() =>
-                api('/api/returns', {
-                  method: 'POST',
-                  body: JSON.stringify({ desi: returnDesi }),
-                }),
-              )
+              run(() => api('/api/returns', { method: 'POST', body: JSON.stringify({ desi: returnDesi }) }))
             }
             disabled={busy || !started}
           >
             <PackagePlus size={18} /> Iade Ekle
           </button>
+        </section>
+
+        {/* Hub cargo pool */}
+        <section>
+          <h2>
+            <Building2 size={18} /> Hub Kargo Havuzu
+          </h2>
+          <div className="meta-row" style={{ marginBottom: 8 }}>
+            <span>Bekliyor: {hubWaiting.length}</span>
+            <span>Atandi: {hubAssigned.length}</span>
+          </div>
+          <div className="pool">
+            {hubWaiting.length === 0 && <p>Hub'da bekleyen kargo yok.</p>}
+            {hubWaiting.map((cargo) => (
+              <article className="pool-item" key={cargo.id}>
+                <div>
+                  <strong>{cargo.desi} desi</strong>
+                  <small>{cargo.label}</small>
+                </div>
+                <span>Hub'da bekliyor</span>
+              </article>
+            ))}
+          </div>
         </section>
 
         <section>
@@ -359,9 +462,12 @@ export default function App() {
             <MapPin size={18} /> Olay Akisi
           </h2>
           <div className="log">
-            {(state?.messages ?? []).slice().reverse().map((message, index) => (
-              <p key={`${message}-${index}`}>{message}</p>
-            ))}
+            {(state?.messages ?? [])
+              .slice()
+              .reverse()
+              .map((msg, i) => (
+                <p key={`${msg}-${i}`}>{msg}</p>
+              ))}
           </div>
         </section>
       </aside>
