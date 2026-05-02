@@ -1,7 +1,18 @@
 import { useEffect, useMemo, useState } from 'react';
-import { MapContainer, Marker, Polyline, Popup, TileLayer, CircleMarker } from 'react-leaflet';
+import {
+  CircleMarker,
+  MapContainer,
+  Marker,
+  Polyline,
+  Popup,
+  TileLayer,
+  ZoomControl,
+} from 'react-leaflet';
 import L from 'leaflet';
 import {
+  Activity,
+  Boxes,
+  Layers,
   PackageCheck,
   PackagePlus,
   Pause,
@@ -9,25 +20,40 @@ import {
   RotateCcw,
   Route,
   StepForward,
-  Truck,
   Timer,
-  MapPin,
+  Truck,
   Wifi,
   WifiOff,
-  Building2,
-  Clock,
 } from 'lucide-react';
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000';
 const CENTER = [41.1956, 32.6227];
 const SPEED_OPTIONS = [1, 2, 4, 8, 16];
 
+const STATUS_META = {
+  idle: { label: 'Hazir' },
+  moving: { label: 'Yolda' },
+  servicing_delivery: { label: 'Teslimat' },
+  servicing_return: { label: 'Iade' },
+  loading: { label: 'Yukleniyor' },
+  done: { label: 'Tamam' },
+};
+
 function markerIcon(color, status) {
   return L.divIcon({
     className: `courier-marker ${status}`,
     html: `<span style="background:${color};color:${color}"></span>`,
-    iconSize: [24, 24],
-    iconAnchor: [12, 12],
+    iconSize: [34, 34],
+    iconAnchor: [17, 17],
+  });
+}
+
+function hubIcon() {
+  return L.divIcon({
+    className: 'hub-marker',
+    html: '<div class="hub-pulse"></div><div class="hub-core">HUB</div>',
+    iconSize: [44, 44],
+    iconAnchor: [22, 22],
   });
 }
 
@@ -44,15 +70,7 @@ async function api(path, options = {}) {
 }
 
 function statusLabel(status) {
-  const labels = {
-    idle: 'hazir',
-    moving: 'yolda',
-    servicing_delivery: 'teslimat',
-    servicing_return: 'iade alma',
-    loading: 'yukleniyor',
-    done: 'tamamlandi',
-  };
-  return labels[status] ?? status;
+  return STATUS_META[status]?.label ?? status;
 }
 
 function loadBreakdown(courier) {
@@ -60,6 +78,676 @@ function loadBreakdown(courier) {
     .filter((s) => s.kind === 'delivery' && s.status === 'pending')
     .reduce((t, s) => t + s.desi, 0);
   return { deliveryLoad, returnLoad: Math.max(0, courier.current_load - deliveryLoad) };
+}
+
+function kmValue(value = 0) {
+  return `${Number(value || 0).toFixed(2)} km`;
+}
+
+function tl(value = 0) {
+  return `${Number(value || 0).toFixed(2)} TL`;
+}
+
+function CommandBar({
+  state,
+  started,
+  running,
+  connected,
+  busy,
+  totalCapacity,
+  simProgress,
+  endHour,
+  onPlan,
+  onRun,
+  onPause,
+  onStep,
+  onSpeed,
+}) {
+  const couriers = state?.couriers ?? [];
+  const usedCap = couriers.reduce((s, c) => s + c.current_load, 0);
+  const pendingStops = couriers
+    .flatMap((c) => c.route)
+    .filter((s) => s.kind !== 'hub' && s.status === 'pending').length;
+  const doneStops = couriers
+    .flatMap((c) => c.route)
+    .filter((s) => s.kind !== 'hub' && s.status === 'done').length;
+  const hubWaiting = state?.hub_cargo_pool?.filter((c) => c.status === 'waiting').length ?? 0;
+  const returnsPending = state?.pending_returns?.length ?? 0;
+  const metrics = state?.owner_metrics ?? {};
+  const activeVehicles = couriers.filter((c) => c.movement_status === 'moving').length;
+  const nearEod = simProgress > 0.8;
+
+  return (
+    <header className="cmdbar">
+      <div className="cmd-brand">
+        <div className="logo">
+          <Route size={21} />
+        </div>
+        <div className="brand-text">
+          <span className="brand-eyebrow">FIDEL.IO · KARABUK MERKEZ</span>
+          <span className="brand-title">Dinamik Rotalama Operasyon Merkezi</span>
+        </div>
+      </div>
+
+      <div className="cmd-clock">
+        <div className="clock-face">
+          <span className="clock-now mono">{state?.sim_clock ?? '10:00'}</span>
+          <span className="clock-sep">/</span>
+          <span className="clock-end mono">{state?.end_clock ?? `${endHour}:00`}</span>
+          {running && <span className="live-dot" />}
+          <span className={`conn ${connected ? 'ok' : 'fail'}`}>
+            {connected ? <Wifi size={12} /> : <WifiOff size={12} />}
+            {connected ? 'Bagli' : 'Baglanti yok'}
+          </span>
+        </div>
+        <div className="clock-bar">
+          <div className={`clock-fill ${nearEod ? 'eod' : ''}`} style={{ width: `${simProgress * 100}%` }} />
+          <div className="clock-tick" style={{ left: '0%' }}>
+            <span>10:00</span>
+          </div>
+          <div className="clock-tick" style={{ left: '25%' }}>
+            <span>12:00</span>
+          </div>
+          <div className="clock-tick" style={{ left: '50%' }}>
+            <span>14:00</span>
+          </div>
+          <div className="clock-tick" style={{ left: '75%' }}>
+            <span>16:00</span>
+          </div>
+          <div className="clock-tick clock-tick-end">
+            <span>{state?.end_clock ?? `${endHour}:00`}</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="cmd-kpis">
+        <KPI label="Arac" value={`${activeVehicles}/${couriers.length || 0}`} sub="hareketli" />
+        <KPI
+          label="Doluluk"
+          value={`${totalCapacity ? Math.round((usedCap / totalCapacity) * 100) : 0}%`}
+          sub={`${usedCap}/${totalCapacity} desi`}
+          tone={totalCapacity && usedCap / totalCapacity > 0.85 ? 'warn' : ''}
+        />
+        <KPI label="Durak" value={pendingStops} sub={`${doneStops} tamam`} />
+        <KPI label="Hub" value={hubWaiting} sub="bekliyor" tone={hubWaiting > 3 ? 'warn' : ''} />
+        <KPI label="Iade" value={returnsPending} sub="havuzda" tone={returnsPending > 0 ? 'warn' : ''} />
+        <KPI label="Kazanc" value={tl(metrics.saved_tl ?? 0)} sub={kmValue(metrics.saved_km ?? 0)} tone={(metrics.saved_tl ?? 0) > 0 ? 'good' : ''} />
+      </div>
+
+      <div className="cmd-controls">
+        <button className="ic-btn" onClick={onStep} disabled={busy || !started || running} title="5 sn ileri">
+          <StepForward size={14} />
+        </button>
+        <button
+          className={`run-btn ${running ? 'is-running' : ''}`}
+          onClick={running ? onPause : onRun}
+          disabled={busy || !started}
+        >
+          {running ? <Pause size={13} /> : <Play size={13} />}
+          {running ? 'Duraklat' : 'Baslat'}
+        </button>
+        <div className="speed-pills" aria-label="Simulasyon hizi">
+          {SPEED_OPTIONS.map((m) => (
+            <button
+              key={m}
+              className={state?.speed_multiplier === m ? 'active' : ''}
+              onClick={() => onSpeed(m)}
+              disabled={busy || !started}
+            >
+              {m}x
+            </button>
+          ))}
+        </div>
+        <button className="ic-btn replan" onClick={onPlan} disabled={busy}>
+          <RotateCcw size={14} />
+          <span>Yeniden Planla</span>
+        </button>
+      </div>
+    </header>
+  );
+}
+
+function KPI({ label, value, sub, tone }) {
+  return (
+    <div className={`kpi ${tone || ''}`}>
+      <div className="kpi-label">{label}</div>
+      <div className="kpi-value mono">{value}</div>
+      <div className="kpi-sub">{sub}</div>
+    </div>
+  );
+}
+
+function PlanPanel({ capacities, setCapacities, seed, setSeed, endHour, setEndHour, onPlan, busy, vehicles }) {
+  return (
+    <section className="plan-panel">
+      <div className="plan-title">
+        <Layers size={15} />
+        <span>Planlama</span>
+      </div>
+      <label>
+        Arac desileri
+        <input value={capacities} onChange={(e) => setCapacities(e.target.value)} />
+      </label>
+      <div className="plan-grid">
+        <label>
+          Seed
+          <input type="number" value={seed} onChange={(e) => setSeed(Number(e.target.value))} />
+        </label>
+        <label>
+          Mesai bitis
+          <input
+            type="number"
+            value={endHour}
+            min={11}
+            max={24}
+            onChange={(e) => setEndHour(Number(e.target.value))}
+          />
+        </label>
+      </div>
+      <button className="plan-btn" onClick={onPlan} disabled={busy || vehicles.length === 0}>
+        <Route size={16} />
+        Rota Planla
+      </button>
+    </section>
+  );
+}
+
+function FleetRail({ state, selected, setSelected, planPanel }) {
+  const couriers = state?.couriers ?? [];
+
+  return (
+    <aside className="rail rail-left">
+      <div className="rail-head">
+        <div>
+          <div className="rail-title">Filo</div>
+          <div className="rail-sub">{couriers.length} arac · canli operasyon</div>
+        </div>
+        <span className="rail-chip">
+          <Truck size={13} />
+          {state?.speed_kmh ?? 70} km/s
+        </span>
+      </div>
+
+      {planPanel}
+
+      <div className="fleet-list">
+        {couriers.length === 0 && <p className="empty-state">Rota planlaninca araclar burada gorunur.</p>}
+        {couriers.map((courier) => {
+          const pct = Math.min(100, Math.round((courier.current_load / courier.capacity_desi) * 100));
+          const pending = courier.route.filter((s) => s.status === 'pending' && s.kind !== 'hub').length;
+          const next = courier.route.find((s) => s.status === 'pending' && s.kind !== 'hub');
+          const { deliveryLoad, returnLoad } = loadBreakdown(courier);
+          const isSel = selected === courier.id;
+
+          return (
+            <article
+              className={`fleet-card ${isSel ? 'selected' : ''}`}
+              key={courier.id}
+              onClick={() => setSelected(isSel ? null : courier.id)}
+            >
+              <div className="fc-head">
+                <div className="fc-id">
+                  <span className="fc-dot" style={{ background: courier.color }} />
+                  <strong>{courier.name}</strong>
+                </div>
+                <span className={`fc-status status-${courier.movement_status}`}>
+                  <span className="status-pip" />
+                  {statusLabel(courier.movement_status)}
+                </span>
+              </div>
+
+              <div className="fc-loadrow">
+                <div className="fc-loadbar">
+                  <div className="fc-load-fill" style={{ width: `${pct}%`, background: courier.color }} />
+                  {[25, 50, 75].map((tick) => (
+                    <span key={tick} className="fc-tick" style={{ left: `${tick}%` }} />
+                  ))}
+                </div>
+                <div className="fc-loadnum mono">
+                  {courier.current_load}
+                  <small>/{courier.capacity_desi}</small>
+                </div>
+              </div>
+
+              <div className="fc-meta">
+                <span>
+                  <b>{pending}</b> durak
+                </span>
+                <span className="dot-sep">·</span>
+                <span>Teslimat {deliveryLoad}d</span>
+                <span className="dot-sep">·</span>
+                <span>Iade {returnLoad}d</span>
+                {courier.service_remaining_seconds > 0 && (
+                  <>
+                    <span className="dot-sep">·</span>
+                    <span className="warn-text">{courier.service_remaining_seconds}s servis</span>
+                  </>
+                )}
+              </div>
+
+              {next && (
+                <div className="fc-next">
+                  <span className="next-arrow">→</span>
+                  <span className="next-label">{next.label}</span>
+                  <span className="next-desi mono">{next.desi}d</span>
+                </div>
+              )}
+
+              {courier.route_error && <p className="route-error">{courier.route_error}</p>}
+
+              {isSel && (
+                <div className="fc-manifest">
+                  <div className="manifest-hd">Yukleme sirasi</div>
+                  {courier.route
+                    .filter((s) => s.kind !== 'hub')
+                    .map((stop, index) => (
+                      <div key={stop.id} className={`mf-row ${stop.status} ${stop.kind}`}>
+                        <span className="mf-idx mono">{String(index + 1).padStart(2, '0')}</span>
+                        <span className="mf-pin" />
+                        <span className="mf-label">{stop.label}</span>
+                        <span className="mf-desi mono">{stop.desi}d</span>
+                        <span className="mf-check">{stop.status === 'done' ? '✓' : '○'}</span>
+                      </div>
+                    ))}
+                </div>
+              )}
+            </article>
+          );
+        })}
+      </div>
+    </aside>
+  );
+}
+
+function LiveMap({ state }) {
+  const couriers = state?.couriers ?? [];
+  const pendingReturns = state?.pending_returns ?? [];
+
+  return (
+    <div className="map-stage">
+      <MapContainer center={CENTER} zoom={13} scrollWheelZoom zoomControl={false} className="map">
+        <ZoomControl position="bottomright" />
+        <TileLayer
+          attribution="&copy; OpenStreetMap contributors &copy; CARTO"
+          url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
+        />
+        <Marker position={CENTER} icon={hubIcon()} interactive={false} />
+        {couriers.map((courier) =>
+          courier.polyline?.length ? (
+            <Polyline
+              key={`${courier.id}-shadow`}
+              positions={courier.polyline}
+              pathOptions={{ color: courier.color, weight: 14, opacity: 0.1, lineCap: 'round', lineJoin: 'round' }}
+            />
+          ) : null,
+        )}
+        {couriers.map((courier) =>
+          courier.polyline?.length ? (
+            <Polyline
+              key={`${courier.id}-route`}
+              positions={courier.polyline}
+              pathOptions={{
+                color: courier.color,
+                weight: 4,
+                opacity: 0.92,
+                dashArray: courier.movement_status === 'moving' ? '10 8' : undefined,
+                lineCap: 'round',
+                lineJoin: 'round',
+                className: courier.movement_status === 'moving' ? 'route-flow' : '',
+              }}
+            />
+          ) : null,
+        )}
+        {couriers.flatMap((courier) =>
+          courier.route
+            .filter((stop) => stop.kind !== 'hub')
+            .map((stop) => (
+              <CircleMarker
+                key={stop.id}
+                center={[stop.lat, stop.lon]}
+                radius={stop.kind === 'return' ? 8 : 6}
+                pathOptions={{
+                  color: stop.kind === 'return' ? '#b91c1c' : courier.color,
+                  fillColor: stop.kind === 'return' ? '#ef4444' : courier.color,
+                  fillOpacity: stop.status === 'done' ? 0.28 : 0.88,
+                  weight: 2,
+                }}
+              >
+                <Popup>
+                  <strong>{stop.label}</strong>
+                  <br />
+                  {stop.kind} · {stop.desi} desi · {stop.status}
+                  {stop.cargo_id && (
+                    <>
+                      <br />
+                      <small>{stop.cargo_id}</small>
+                    </>
+                  )}
+                </Popup>
+              </CircleMarker>
+            )),
+        )}
+        {pendingReturns.map((job) => (
+          <CircleMarker
+            key={job.id}
+            center={[job.lat, job.lon]}
+            radius={9}
+            pathOptions={{
+              color: job.deferred ? '#b45309' : '#b91c1c',
+              fillColor: job.deferred ? '#f59e0b' : '#ef4444',
+              fillOpacity: 0.9,
+              weight: 2,
+            }}
+          >
+            <Popup>
+              <strong>{job.deferred ? 'Oncelikli iade' : 'Havuzdaki iade'}</strong>
+              <br />
+              {job.desi} desi
+              <br />
+              {job.message}
+            </Popup>
+          </CircleMarker>
+        ))}
+        {couriers.map((courier) => (
+          <Marker key={courier.id} position={[courier.lat, courier.lon]} icon={markerIcon(courier.color, courier.movement_status)}>
+            <Popup>
+              <strong>{courier.name}</strong>
+              <br />
+              {courier.current_load}/{courier.capacity_desi} desi
+              <br />
+              {statusLabel(courier.movement_status)}
+            </Popup>
+          </Marker>
+        ))}
+      </MapContainer>
+
+      <div className="map-legend">
+        <div className="legend-row">
+          <span className="lg-pin lg-deliver" /> Teslimat
+        </div>
+        <div className="legend-row">
+          <span className="lg-pin lg-return" /> Iade
+        </div>
+        <div className="legend-row">
+          <span className="lg-pin lg-hub" /> Hub
+        </div>
+        <div className="legend-row">
+          <span className="lg-line" /> Aktif rota
+        </div>
+      </div>
+      <div className="map-zoom-meta">
+        <span className="mono">41.196N · 32.623E</span>
+        <span className="dot-sep">·</span>
+        <span>OSM · Karabuk drive graph</span>
+      </div>
+    </div>
+  );
+}
+
+function EventsRail({ state, tab, setTab, returnDesi, setReturnDesi, onAddReturn, busy, started }) {
+  const hubWaiting = state?.hub_cargo_pool?.filter((c) => c.status === 'waiting') ?? [];
+  const hubAssigned = state?.hub_cargo_pool?.filter((c) => c.status === 'assigned') ?? [];
+  const pendingReturns = state?.pending_returns ?? [];
+  const completedReturns = state?.completed_returns ?? [];
+  const messages = (state?.messages ?? []).slice().reverse();
+  const events = state?.owner_events ?? [];
+  const metrics = state?.owner_metrics ?? {};
+  const costPerKm = metrics.cost_per_km_tl ?? 35;
+
+  return (
+    <aside className="rail rail-right">
+      <div className="rail-tabs">
+        <button className={tab === 'events' ? 'active' : ''} onClick={() => setTab('events')}>
+          Akis
+        </button>
+        <button className={tab === 'hub' ? 'active' : ''} onClick={() => setTab('hub')}>
+          Hub <span className="tab-badge">{hubWaiting.length}</span>
+        </button>
+        <button className={tab === 'returns' ? 'active' : ''} onClick={() => setTab('returns')}>
+          Iade <span className="tab-badge">{pendingReturns.length}</span>
+        </button>
+        <button className={tab === 'proof' ? 'active' : ''} onClick={() => setTab('proof')}>
+          Kazanc <span className="tab-badge">{events.length}</span>
+        </button>
+      </div>
+
+      {tab === 'events' && (
+        <div className="events-pane">
+          <div className="rail-head plain">
+            <div>
+              <div className="rail-title">Olay Akisi</div>
+              <div className="rail-sub">son olaylar · tick {state?.tick ?? 0}</div>
+            </div>
+            <span className="live-pill">CANLI</span>
+          </div>
+          <ol className="evlist">
+            {messages.length === 0 && <li className="ev-info empty">Henüz olay yok.</li>}
+            {messages.map((message, index) => {
+              const cls = message.includes('eklendi')
+                ? 'ev-route'
+                : message.includes('tamam')
+                  ? 'ev-done'
+                  : message.includes('Hub')
+                    ? 'ev-hub'
+                    : message.includes('yuklen') || message.includes('yüklen')
+                      ? 'ev-load'
+                      : message.includes('ertelendi')
+                        ? 'ev-warn'
+                        : 'ev-info';
+              return (
+                <li key={`${message}-${index}`} className={cls}>
+                  <span className="ev-time mono">{state?.sim_clock ?? '10:00'}</span>
+                  <span className="ev-pip" />
+                  <span className="ev-msg">{message}</span>
+                </li>
+              );
+            })}
+          </ol>
+        </div>
+      )}
+
+      {tab === 'hub' && (
+        <div className="hub-pane">
+          <div className="rail-head plain">
+            <div>
+              <div className="rail-title">Hub Kargo Havuzu</div>
+              <div className="rail-sub">bekleyen ve atanmis kargolar</div>
+            </div>
+          </div>
+          <div className="hub-stats">
+            <div>
+              <span className="mono">{hubWaiting.length}</span>
+              <small>bekliyor</small>
+            </div>
+            <div>
+              <span className="mono">{hubAssigned.length}</span>
+              <small>atandi</small>
+            </div>
+            <div>
+              <span className="mono">{state?.hub_cargo_pool?.reduce((s, c) => s + c.desi, 0) ?? 0}</span>
+              <small>desi</small>
+            </div>
+          </div>
+          <div className="hub-list">
+            {hubWaiting.length === 0 && <p className="empty-state">Hub'da bekleyen kargo yok.</p>}
+            {hubWaiting.map((cargo) => (
+              <article key={cargo.id} className="hub-row">
+                <div className="hub-row-icon">
+                  <Boxes size={15} />
+                </div>
+                <div className="hub-row-body">
+                  <strong>{cargo.label}</strong>
+                  <small>Hub'da bekliyor</small>
+                </div>
+                <div className="hub-row-desi mono">
+                  {cargo.desi}
+                  <small>d</small>
+                </div>
+              </article>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {tab === 'returns' && (
+        <div className="returns-pane">
+          <div className="rail-head plain">
+            <div>
+              <div className="rail-title">Iade Yonetimi</div>
+              <div className="rail-sub">Best Insertion · kapasite kontrollu</div>
+            </div>
+          </div>
+
+          <div className="ret-add">
+            <div className="ret-add-label">Yeni iade ekle</div>
+            <div className="ret-add-row">
+              <input type="number" min="1" max="100" value={returnDesi} onChange={(e) => setReturnDesi(Number(e.target.value))} />
+              <span className="ret-add-unit">desi</span>
+              <button className="ret-add-btn" onClick={onAddReturn} disabled={busy || !started}>
+                <PackagePlus size={14} />
+                Havuza ekle
+              </button>
+            </div>
+          </div>
+
+          <ReturnSection title={`Bekleyen (${pendingReturns.length})`} jobs={pendingReturns} />
+          <ReturnSection title={`Tamamlanan (${completedReturns.length})`} jobs={completedReturns} completed />
+        </div>
+      )}
+
+      {tab === 'proof' && (
+        <div className="proof-pane">
+          <div className="rail-head plain">
+            <div>
+              <div className="rail-title">Maliyet Kaniti</div>
+              <div className="rail-sub">{costPerKm} TL/km varsayim</div>
+            </div>
+          </div>
+          <div className="proof-summary">
+            <div>
+              <span className="mono">{tl(metrics.saved_tl ?? 0)}</span>
+              <small>net kazanc</small>
+            </div>
+            <div>
+              <span className="mono">{kmValue(metrics.saved_km ?? 0)}</span>
+              <small>tasarruf</small>
+            </div>
+            <div>
+              <span className="mono">{tl(metrics.dynamic_extra_tl ?? 0)}</span>
+              <small>ek maliyet</small>
+            </div>
+          </div>
+          <div className="decision-list">
+            {events.length === 0 && <p className="empty-state">Henuz dinamik iade kazanci olusmadi.</p>}
+            {events
+              .slice()
+              .reverse()
+              .map((event) => {
+                const baselineKm = (event.baseline_distance_m ?? 0) / 1000;
+                const extraKm = (event.extra_cost_m ?? 0) / 1000;
+                const savedKm = (event.saved_distance_m ?? 0) / 1000;
+                return (
+                  <article className="decision-card" key={event.id}>
+                    <div className="decision-title">
+                      <strong>{event.return_desi ?? 0} desi iade</strong>
+                      <span>{event.courier_id}</span>
+                    </div>
+                    <div className="decision-metrics">
+                      <span>
+                        <b>{kmValue(baselineKm)}</b>
+                        Ayri pickup
+                      </span>
+                      <span>
+                        <b>{kmValue(extraKm)}</b>
+                        Dinamik ek
+                      </span>
+                      <span>
+                        <b>{tl(savedKm * costPerKm)}</b>
+                        Net kazanc
+                      </span>
+                    </div>
+                    <p>{event.message}</p>
+                  </article>
+                );
+              })}
+          </div>
+        </div>
+      )}
+    </aside>
+  );
+}
+
+function ReturnSection({ title, jobs, completed = false }) {
+  return (
+    <section className="ret-section">
+      <div className="ret-section-hd">{title}</div>
+      {jobs.length === 0 && <p className="empty-state">Kayit yok.</p>}
+      {jobs.map((job) => (
+        <article key={job.id} className={`ret-row ${completed ? 'done' : ''} ${job.deferred ? 'deferred' : ''}`}>
+          <div className="ret-row-top">
+            <span className="ret-icon">{completed ? <PackageCheck size={11} /> : <Timer size={11} />}</span>
+            <strong className="mono">{job.desi} desi</strong>
+            {job.deferred && <span className="ret-badge warn">ONCELIKLI</span>}
+            {job.assigned_courier_id && <span className="ret-badge ok">{job.assigned_courier_id}</span>}
+            {job.assigned && <span className="ret-badge ok">{job.assigned}</span>}
+          </div>
+          <div className="ret-row-msg">{job.message}</div>
+        </article>
+      ))}
+    </section>
+  );
+}
+
+function TelemetryStrip({ state, connected }) {
+  const couriers = state?.couriers ?? [];
+  const routeStops = couriers.flatMap((c) => c.route).filter((s) => s.kind !== 'hub').length;
+  const routePoints = couriers.reduce((sum, c) => sum + (c.polyline?.length ?? 0), 0);
+  const insertions = (state?.completed_returns?.length ?? 0) + (state?.pending_returns?.filter((r) => r.assigned).length ?? 0);
+  const metrics = state?.owner_metrics ?? {};
+
+  return (
+    <footer className="telemetry">
+      <div className="tel-cell">
+        <span className="tel-eye">ALGORITMA</span>
+        <strong className="mono">Geographic-aware FFD · Best Insertion</strong>
+      </div>
+      <div className="tel-divider" />
+      <div className="tel-cell">
+        <span className="tel-eye">YOL GRAFI</span>
+        <strong>OSMnx · {state?.graph_source ?? 'bekleniyor'} · NetworkX shortest path</strong>
+      </div>
+      <div className="tel-divider" />
+      <div className="tel-cell">
+        <span className="tel-eye">ROTA</span>
+        <strong className="mono">{routeStops} durak · {routePoints} nokta</strong>
+      </div>
+      <div className="tel-divider" />
+      <div className="tel-cell">
+        <span className="tel-eye">BEST INSERTION</span>
+        <strong className="mono">{insertions} basarili</strong>
+      </div>
+      <div className="tel-divider" />
+      <div className="tel-cell">
+        <span className="tel-eye">AYRI PICKUP</span>
+        <strong className="mono">{kmValue(metrics.baseline_pickup_km ?? 0)}</strong>
+      </div>
+      <div className="tel-divider" />
+      <div className="tel-cell">
+        <span className="tel-eye">NET KAZANC</span>
+        <strong className="mono">{tl(metrics.saved_tl ?? 0)}</strong>
+      </div>
+      <div className="tel-divider" />
+      <div className="tel-cell">
+        <span className="tel-eye">ORT. HIZ</span>
+        <strong className="mono">{state?.speed_kmh ?? 70} km/s · sim {state?.speed_multiplier ?? 1}x</strong>
+      </div>
+      <div className="tel-spacer" />
+      <div className={`tel-cell tel-status ${connected ? 'ok' : 'fail'}`}>
+        <span className="tel-pip" />
+        <strong>{connected ? `Backend bagli · tick ${state?.tick ?? 0}` : 'Backend baglantisi yok'}</strong>
+      </div>
+    </footer>
+  );
 }
 
 export default function App() {
@@ -71,6 +759,8 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [connected, setConnected] = useState(false);
   const [endHour, setEndHour] = useState(18);
+  const [selected, setSelected] = useState(null);
+  const [rightTab, setRightTab] = useState('proof');
 
   const vehicles = useMemo(
     () =>
@@ -86,7 +776,8 @@ export default function App() {
     setBusy(true);
     setError('');
     try {
-      setState(await action());
+      const nextState = await action();
+      setState(nextState);
       setConnected(true);
     } catch (err) {
       setError(err.message);
@@ -109,413 +800,86 @@ export default function App() {
 
   const started = Boolean(state?.started);
   const running = Boolean(state?.running);
-
   const workingHoursEndS = Math.max(1, (endHour - 10) * 3600);
-  const totalCapacity = vehicles.reduce((s, v) => s + v.capacity_desi, 0);
+  const totalCapacity = state?.couriers?.reduce((s, c) => s + c.capacity_desi, 0) ?? vehicles.reduce((s, v) => s + v.capacity_desi, 0);
   const simElapsed = state?.sim_elapsed_seconds ?? 0;
   const simEnd = state?.working_hours_end_s ?? workingHoursEndS;
-  const simProgress = simEnd > 0 ? Math.min(1, simElapsed / simEnd) : 0;
-  const nearEod = simProgress > 1 - 0.2;
-  const hubWaiting = state?.hub_cargo_pool?.filter((c) => c.status === 'waiting') ?? [];
-  const hubAssigned = state?.hub_cargo_pool?.filter((c) => c.status === 'assigned') ?? [];
+  const simProgress = simEnd > 0 ? Math.min(1, Math.max(0, simElapsed / simEnd)) : 0;
+
+  const onPlan = () =>
+    run(() =>
+      api('/api/sim/start', {
+        method: 'POST',
+        body: JSON.stringify({ seed, vehicles, working_hours_end_s: workingHoursEndS }),
+      }),
+    );
+  const onRun = () => run(() => api('/api/sim/run', { method: 'POST' }));
+  const onPause = () => run(() => api('/api/sim/pause', { method: 'POST' }));
+  const onStep = () => run(() => api('/api/sim/tick', { method: 'POST' }));
+  const onSpeed = (multiplier) => run(() => api('/api/sim/speed', { method: 'POST', body: JSON.stringify({ multiplier }) }));
+  const onAddReturn = () =>
+    run(() =>
+      api('/api/returns', {
+        method: 'POST',
+        body: JSON.stringify({ desi: returnDesi }),
+      }),
+    );
+
+  const planPanel = (
+    <PlanPanel
+      capacities={capacities}
+      setCapacities={setCapacities}
+      seed={seed}
+      setSeed={setSeed}
+      endHour={endHour}
+      setEndHour={setEndHour}
+      onPlan={onPlan}
+      busy={busy}
+      vehicles={vehicles}
+    />
+  );
 
   return (
-    <main className="shell">
-      {/* LEFT PANEL */}
-      <aside className="panel left-panel">
-        <header>
-          <div>
-            <p>Karabuk Merkez — OSM graph</p>
-            <h1>Dinamik Kargo Rotalama</h1>
-          </div>
-          <div className="header-badges">
-            <span className={`status ${running ? 'live' : ''}`}>
-              {running ? 'Canli' : started ? 'Duraklatildi' : 'Hazir'}
-            </span>
-            <span className={`conn-badge ${connected ? 'conn-ok' : 'conn-fail'}`}>
-              {connected ? <Wifi size={11} /> : <WifiOff size={11} />}
-              {connected ? 'Bagli' : 'Baglanti yok'}
-            </span>
-          </div>
-        </header>
+    <main className="ops-root">
+      <CommandBar
+        state={state}
+        started={started}
+        running={running}
+        connected={connected}
+        busy={busy}
+        totalCapacity={totalCapacity}
+        simProgress={simProgress}
+        endHour={endHour}
+        onPlan={onPlan}
+        onRun={onRun}
+        onPause={onPause}
+        onStep={onStep}
+        onSpeed={onSpeed}
+      />
 
-        <section className="meta-row">
-          <span>Tick {state?.tick ?? 0}</span>
-          <span>{state?.speed_kmh ?? 70} km/s</span>
-          <span>Sim {state?.speed_multiplier ?? 2}x</span>
-          <span>{totalCapacity} desi toplam kapasite</span>
-          <span>{state?.graph_source ?? 'graph bekleniyor'}</span>
-        </section>
-
-        {/* Simulated working-hours clock */}
-        <section className="work-hours-section">
-          <div className="sim-clock-display">
-            <Clock size={15} />
-            <span className={`sim-clock-now ${nearEod ? 'wh-eod-text' : ''}`}>
-              {state?.sim_clock ?? '10:00'}
-            </span>
-            <span className="sim-clock-sep">—</span>
-            <span className="sim-clock-end">{state?.end_clock ?? `${endHour}:00`}</span>
-            {running && <span className="sim-running-dot" title="Calisiyor" />}
-          </div>
-          <div className="work-hours-row">
-            <span className="wh-label">10:00</span>
-            <div className="work-hours-bar">
-              <span
-                className={`wh-fill ${nearEod ? 'wh-eod' : ''}`}
-                style={{ width: `${Math.max(0, simProgress * 100)}%` }}
-              />
-            </div>
-            <span className="wh-label">{state?.end_clock ?? `${endHour}:00`}</span>
-          </div>
-          {nearEod && <p className="cap-warning">Mesai bitisine yaklasiliyor.</p>}
-        </section>
-
-        {/* Vehicle + seed config */}
-        <section className="controls">
-          <label>
-            Arac desileri
-            <input value={capacities} onChange={(e) => setCapacities(e.target.value)} />
-          </label>
-          <label>
-            Seed
-            <input type="number" value={seed} onChange={(e) => setSeed(Number(e.target.value))} />
-          </label>
-          <label>
-            Mesai bitis
-            <input
-              type="number"
-              value={endHour}
-              min={11}
-              max={24}
-              onChange={(e) => setEndHour(Number(e.target.value))}
-            />
-          </label>
-        </section>
-
-        {/* Route planning */}
-        <section style={{ display: 'grid' }}>
-          <button
-            className="btn-plan"
-            onClick={() =>
-              run(() =>
-                api('/api/sim/start', {
-                  method: 'POST',
-                  body: JSON.stringify({ seed, vehicles, working_hours_end_s: workingHoursEndS }),
-                }),
-              )
-            }
-            disabled={busy || vehicles.length === 0}
-          >
-            <Route size={18} /> Rota Planla
-          </button>
-        </section>
-
-        {/* Playback controls */}
-        <section className="controls run-controls">
-          <button
-            className="btn-start"
-            onClick={() => run(() => api('/api/sim/run', { method: 'POST' }))}
-            disabled={busy || !started || running}
-          >
-            <Play size={18} /> Baslat
-          </button>
-          <button onClick={() => run(() => api('/api/sim/pause', { method: 'POST' }))} disabled={busy || !started || !running}>
-            <Pause size={18} /> Duraklat
-          </button>
-          <button onClick={() => run(() => api('/api/sim/tick', { method: 'POST' }))} disabled={busy || !started || running}>
-            <StepForward size={18} /> 5 sn
-          </button>
-        </section>
-
-        <section className="speed-control">
-          {SPEED_OPTIONS.map((m) => (
-            <button
-              key={m}
-              className={state?.speed_multiplier === m ? 'active' : ''}
-              onClick={() => run(() => api('/api/sim/speed', { method: 'POST', body: JSON.stringify({ multiplier: m }) }))}
-              disabled={busy}
-            >
-              {m}x
-            </button>
-          ))}
-        </section>
-
-        {error && <div className="error">{error}</div>}
-
-        {/* Vehicle cards */}
-        <section>
-          <h2>
-            <Truck size={18} /> Araclar
-          </h2>
-          <div className="cards">
-            {state?.couriers?.map((courier) => {
-              const pct = Math.round((courier.current_load / courier.capacity_desi) * 100);
-              const { deliveryLoad, returnLoad } = loadBreakdown(courier);
-              const deliveries = courier.route.filter((s) => s.kind === 'delivery');
-              const pending = courier.route.filter((s) => s.status === 'pending' && s.kind !== 'hub').length;
-              return (
-                <article className="card" key={courier.id}>
-                  <div className="card-title">
-                    <span className="dot" style={{ background: courier.color }} />
-                    <strong>{courier.name}</strong>
-                    <span>
-                      {courier.current_load}/{courier.capacity_desi} desi
-                    </span>
-                  </div>
-                  <div className="bar">
-                    <span style={{ width: `${Math.min(100, pct)}%`, background: courier.color }} />
-                  </div>
-                  <div className="load-split">
-                    <span>Teslimat {deliveryLoad} desi</span>
-                    <span>Iade {returnLoad} desi</span>
-                  </div>
-                  <p>{pending} bekleyen durak</p>
-                  <p>
-                    {statusLabel(courier.movement_status)}
-                    {courier.service_remaining_seconds > 0 ? ` — ${courier.service_remaining_seconds} sn` : ''}
-                  </p>
-                  {courier.route_error && <p className="route-error">{courier.route_error}</p>}
-
-                  {/* Cargo manifest */}
-                  {deliveries.length > 0 && (
-                    <div className="cargo-manifest">
-                      <div className="manifest-header">Yukleme Sirasi</div>
-                      {deliveries.map((stop, idx) => (
-                        <div key={stop.id} className={`manifest-entry ${stop.status}`}>
-                          <span className="manifest-order">{idx + 1}</span>
-                          <span className="manifest-label">{stop.label}</span>
-                          <span className="manifest-desi">{stop.desi} desi</span>
-                          <span className="manifest-check">{stop.status === 'done' ? '✓' : '○'}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </article>
-              );
-            })}
-          </div>
-        </section>
-      </aside>
-
-      {/* MAP */}
-      <section className="map-wrap">
-        <MapContainer center={CENTER} zoom={13} scrollWheelZoom className="map">
-          <TileLayer
-            attribution="&copy; OpenStreetMap contributors"
-            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-          />
-          {state?.couriers?.map((courier) =>
-            courier.polyline?.length ? (
-              <Polyline
-                key={`${courier.id}-shadow`}
-                positions={courier.polyline}
-                pathOptions={{ color: courier.color, weight: 12, opacity: 0.18, lineCap: 'round', lineJoin: 'round' }}
-              />
-            ) : null,
-          )}
-          {state?.couriers?.map((courier) =>
-            courier.polyline?.length ? (
-              <Polyline
-                key={`${courier.id}-route`}
-                positions={courier.polyline}
-                pathOptions={{
-                  color: courier.color,
-                  weight: 5,
-                  opacity: 0.92,
-                  lineCap: 'round',
-                  lineJoin: 'round',
-                  className: `route-line ${courier.movement_status === 'moving' ? 'moving' : ''}`,
-                }}
-              />
-            ) : null,
-          )}
-          {state?.couriers?.map((courier) => (
-            <Marker key={courier.id} position={[courier.lat, courier.lon]} icon={markerIcon(courier.color, courier.movement_status)}>
-              <Popup>
-                <strong>{courier.name}</strong>
-                <br />
-                {courier.current_load}/{courier.capacity_desi} desi
-                <br />
-                {statusLabel(courier.movement_status)}
-              </Popup>
-            </Marker>
-          ))}
-          {state?.couriers?.flatMap((courier) =>
-            courier.route.map((stop) => (
-              <CircleMarker
-                key={stop.id}
-                center={[stop.lat, stop.lon]}
-                radius={stop.kind === 'return' ? 8 : 6}
-                pathOptions={{
-                  color: stop.kind === 'return' ? '#db2777' : stop.kind === 'hub' ? '#111827' : courier.color,
-                  fillOpacity: stop.status === 'done' ? 0.25 : 0.8,
-                }}
-              >
-                <Popup>
-                  <strong>{stop.label}</strong>
-                  <br />
-                  {stop.kind} — {stop.desi} desi — {stop.status}
-                  {stop.cargo_id && (
-                    <>
-                      <br />
-                      <small>{stop.cargo_id}</small>
-                    </>
-                  )}
-                </Popup>
-              </CircleMarker>
-            )),
-          )}
-          {state?.pending_returns?.map((job) => (
-            <CircleMarker
-              key={job.id}
-              center={[job.lat, job.lon]}
-              radius={9}
-              pathOptions={{
-                color: job.deferred ? '#ca8a04' : '#dc2626',
-                fillColor: job.deferred ? '#fde68a' : '#fca5a5',
-                fillOpacity: 0.95,
-              }}
-            >
-              <Popup>
-                <strong>{job.deferred ? 'Oncelikli iade' : 'Havuzdaki iade'}</strong>
-                <br />
-                {job.desi} desi
-              </Popup>
-            </CircleMarker>
-          ))}
-        </MapContainer>
-
-        {/* Vehicle status strip */}
-        {state?.couriers?.length > 0 && (
-          <div className="vehicle-strip">
-            {state.couriers.map((courier) => {
-              const pending = courier.route.filter(
-                (s) => s.status === 'pending' && s.kind !== 'hub',
-              ).length;
-              const pct = Math.min(100, Math.round((courier.current_load / courier.capacity_desi) * 100));
-              const nextStop = courier.route.find((s) => s.status === 'pending' && s.kind !== 'hub');
-              return (
-                <div key={courier.id} className="vstrip-card">
-                  <span className="dot vstrip-dot" style={{ background: courier.color }} />
-                  <div className="vstrip-info">
-                    <div className="vstrip-top">
-                      <strong>{courier.name}</strong>
-                      <span className={`vstrip-badge vstrip-${courier.movement_status}`}>
-                        {statusLabel(courier.movement_status)}
-                      </span>
-                    </div>
-                    <div className="vstrip-bar">
-                      <span style={{ width: `${pct}%`, background: courier.color }} />
-                    </div>
-                    <div className="vstrip-bottom">
-                      <span>{courier.current_load}/{courier.capacity_desi} desi</span>
-                      {nextStop ? (
-                        <span className="vstrip-next" title={nextStop.label}>
-                          → {nextStop.label}
-                        </span>
-                      ) : (
-                        <span className="vstrip-done">{pending === 0 ? 'bos' : `${pending} durak`}</span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
+      <section className="ops-grid">
+        <FleetRail state={state} selected={selected} setSelected={setSelected} planPanel={planPanel} />
+        <LiveMap state={state} />
+        <EventsRail
+          state={state}
+          tab={rightTab}
+          setTab={setRightTab}
+          returnDesi={returnDesi}
+          setReturnDesi={setReturnDesi}
+          onAddReturn={onAddReturn}
+          busy={busy}
+          started={started}
+        />
       </section>
 
-      {/* RIGHT PANEL */}
-      <aside className="panel right-panel">
-        <section className="controls two">
-          <label>
-            Iade desi
-            <input type="number" value={returnDesi} onChange={(e) => setReturnDesi(Number(e.target.value))} />
-          </label>
-          <button
-            onClick={() =>
-              run(() => api('/api/returns', { method: 'POST', body: JSON.stringify({ desi: returnDesi }) }))
-            }
-            disabled={busy || !started}
-          >
-            <PackagePlus size={18} /> Iade Ekle
-          </button>
-        </section>
+      {error && (
+        <div className="toast-error">
+          <Activity size={14} />
+          {error}
+        </div>
+      )}
 
-        {/* Hub cargo pool */}
-        <section>
-          <h2>
-            <Building2 size={18} /> Hub Kargo Havuzu
-          </h2>
-          <div className="meta-row" style={{ marginBottom: 8 }}>
-            <span>Bekliyor: {hubWaiting.length}</span>
-            <span>Atandi: {hubAssigned.length}</span>
-          </div>
-          <div className="pool">
-            {hubWaiting.length === 0 && <p>Hub'da bekleyen kargo yok.</p>}
-            {hubWaiting.map((cargo) => (
-              <article className="pool-item" key={cargo.id}>
-                <div>
-                  <strong>{cargo.desi} desi</strong>
-                  <small>{cargo.label}</small>
-                </div>
-                <span>Hub'da bekliyor</span>
-              </article>
-            ))}
-          </div>
-        </section>
-
-        <section>
-          <h2>
-            <Timer size={18} /> Iade Havuzu
-          </h2>
-          <div className="pool">
-            {(state?.pending_returns?.length ?? 0) === 0 && <p>Bekleyen iade yok.</p>}
-            {state?.pending_returns?.map((job) => (
-              <article className={`pool-item ${job.deferred ? 'deferred' : ''}`} key={job.id}>
-                <div>
-                  <strong>{job.desi} desi</strong>
-                  {job.deferred && <small>Oncelikli</small>}
-                </div>
-                <span>{job.message}</span>
-              </article>
-            ))}
-          </div>
-        </section>
-
-        <section>
-          <h2>
-            <PackageCheck size={18} /> Tamamlanan Iadeler
-          </h2>
-          <div className="pool">
-            {(state?.completed_returns?.length ?? 0) === 0 && <p>Tamamlanan iade yok.</p>}
-            {state?.completed_returns?.map((job) => (
-              <article className="pool-item completed" key={job.id}>
-                <div>
-                  <strong>{job.desi} desi</strong>
-                  <small>{job.assigned_courier_id}</small>
-                </div>
-                <span>{job.message}</span>
-              </article>
-            ))}
-          </div>
-        </section>
-
-        <section>
-          <h2>
-            <MapPin size={18} /> Olay Akisi
-          </h2>
-          <div className="log">
-            {(state?.messages ?? [])
-              .slice()
-              .reverse()
-              .map((msg, i) => (
-                <p key={`${msg}-${i}`}>{msg}</p>
-              ))}
-          </div>
-        </section>
-      </aside>
+      <TelemetryStrip state={state} connected={connected} />
     </main>
   );
 }

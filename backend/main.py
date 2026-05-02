@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 KARABUK_CENTER = {"lat": 41.1956, "lon": 32.6227}
 SPATIAL_TRIGGER_KM = float(os.getenv("SPATIAL_TRIGGER_KM", "2.0"))
 SIM_SPEED_KMH = float(os.getenv("SIM_SPEED_KMH", "70"))
+COST_PER_KM_TL = float(os.getenv("COST_PER_KM_TL", "35"))
 GRAPH_PLACE = os.getenv("GRAPH_PLACE", "Karabuk Merkez, Karabuk, Turkiye")
 
 # Working-hours & hub cargo generation
@@ -103,6 +104,8 @@ class Stop:
     service_seconds: int = 0
     status: Literal["pending", "done"] = "pending"
     cargo_id: str | None = None
+    tracking_code: str | None = None
+    customer_label: str | None = None
 
 
 @dataclass
@@ -129,6 +132,24 @@ class ReturnJob:
     created_at: float = field(default_factory=time.time)
     message: str = "Havuzda bekliyor"
     deferred: bool = False
+    extra_cost_m: float | None = None
+    baseline_distance_m: float | None = None
+    saved_distance_m: float | None = None
+
+
+@dataclass
+class DecisionLog:
+    id: str
+    created_at: float
+    kind: str
+    message: str
+    courier_id: str | None = None
+    return_id: str | None = None
+    extra_cost_m: float = 0.0
+    baseline_distance_m: float = 0.0
+    saved_distance_m: float = 0.0
+    projected_load: int | None = None
+    return_desi: int = 0
 
 
 @dataclass
@@ -171,6 +192,7 @@ class SimState:
     pending_returns: list[ReturnJob] = field(default_factory=list)
     completed_returns: list[ReturnJob] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)
+    owner_events: list[DecisionLog] = field(default_factory=list)
     speed_multiplier: float = 4.0
     unassigned_cargos: list[dict] = field(default_factory=list)
     hub_cargo_pool: list[HubCargo] = field(default_factory=list)
@@ -397,6 +419,8 @@ def try_reload_from_hub(courier: Courier) -> None:
                 desi=cargo.desi,
                 service_seconds=3,
                 cargo_id=cargo.id,
+                tracking_code=cargo.id,
+                customer_label=cargo.label,
             )
         )
         cargo.status = "assigned"
@@ -502,6 +526,10 @@ def nearest_node(lat: float, lon: float) -> int:
                 float(graph.nodes[node]["x"]),
             ),
         )
+
+
+def hub_node() -> int:
+    return nearest_node(KARABUK_CENTER["lat"], KARABUK_CENTER["lon"])
 
 
 def edge_length_m(origin: int, destination: int) -> float:
@@ -761,17 +789,28 @@ def complete_service(courier: Courier) -> None:
                 f"{courier.name} hub'a {courier.current_load} desi iade boslatti"
             )
         courier.current_load = 0
-        if not any(job.id == stop.id for job in state.completed_returns):
+        for return_stop in courier.route:
+            if return_stop.kind != "return" or return_stop.status != "done":
+                continue
+            if any(job.id == return_stop.id for job in state.completed_returns):
+                continue
+            event = next(
+                (item for item in state.owner_events if item.return_id == return_stop.id),
+                None,
+            )
             state.completed_returns.append(
                 ReturnJob(
-                    id=stop.id,
-                    lat=stop.lat,
-                    lon=stop.lon,
-                    node=stop.node,
-                    desi=stop.desi,
+                    id=return_stop.id,
+                    lat=return_stop.lat,
+                    lon=return_stop.lon,
+                    node=return_stop.node,
+                    desi=return_stop.desi,
                     status="completed",
                     assigned_courier_id=courier.id,
                     message=f"{courier.name} tarafindan tamamlandi",
+                    extra_cost_m=None if event is None else event.extra_cost_m,
+                    baseline_distance_m=None if event is None else event.baseline_distance_m,
+                    saved_distance_m=None if event is None else event.saved_distance_m,
                 )
             )
 
@@ -899,7 +938,7 @@ def is_spatially_triggered(courier: Courier, job: ReturnJob) -> bool:
 
 
 async def try_assign_return(job: ReturnJob) -> bool:
-    best: tuple[float, Courier, int] | None = None
+    best: tuple[float, Courier, int, int] | None = None
     distance_cache: dict[tuple[int, int], float] = {}
 
     def distance(a: int, b: int) -> float:
@@ -930,14 +969,14 @@ async def try_assign_return(job: ReturnJob) -> bool:
                 - distance(a_node, b_node)
             )
             if best is None or extra_cost < best[0]:
-                best = (extra_cost, courier, idx)
+                best = (extra_cost, courier, idx, projected_load)
 
     if best is None:
         if not job.deferred:
             job.message = "Yakinlik veya kapasite uygunlugu bulunamadi"
         return False
 
-    extra_cost, courier, insertion_index = best
+    extra_cost, courier, insertion_index, projected_load = best
     return_stop = Stop(
         id=job.id,
         kind="return",
@@ -959,8 +998,31 @@ async def try_assign_return(job: ReturnJob) -> bool:
     job.status = "assigned"
     job.assigned_courier_id = courier.id
     job.deferred = False
+    baseline_distance = shortest_path_length_m(hub_node(), job.node) + shortest_path_length_m(job.node, hub_node())
+    saved_distance = max(0.0, baseline_distance - extra_cost)
+    job.extra_cost_m = extra_cost
+    job.baseline_distance_m = baseline_distance
+    job.saved_distance_m = saved_distance
     job.message = f"{courier.name} rotasina eklendi (+{extra_cost / 1000:.2f} km)"
     state.messages.append(job.message)
+    state.owner_events.append(
+        DecisionLog(
+            id=str(uuid4()),
+            created_at=time.time(),
+            kind="return_assignment",
+            courier_id=courier.id,
+            return_id=job.id,
+            extra_cost_m=extra_cost,
+            baseline_distance_m=baseline_distance,
+            saved_distance_m=saved_distance,
+            projected_load=projected_load + job.desi,
+            return_desi=job.desi,
+            message=(
+                f"{job.desi} desi iade {courier.name} rotasina +{extra_cost / 1000:.2f} km ile eklendi; "
+                f"ayri pickup {baseline_distance / 1000:.2f} km, kazanc {saved_distance / 1000:.2f} km"
+            ),
+        )
+    )
     rebuild_courier_path(courier)
     return True
 
@@ -1020,6 +1082,8 @@ def serialize_stop(stop: Stop) -> dict:
         "service_seconds": stop.service_seconds,
         "status": stop.status,
         "cargo_id": stop.cargo_id,
+        "tracking_code": stop.tracking_code,
+        "customer_label": stop.customer_label,
     }
 
 
@@ -1035,6 +1099,115 @@ def serialize_return(job: ReturnJob) -> dict:
         "message": job.message,
         "created_at": job.created_at,
         "deferred": job.deferred,
+        "extra_cost_m": job.extra_cost_m,
+        "baseline_distance_m": job.baseline_distance_m,
+        "saved_distance_m": job.saved_distance_m,
+    }
+
+
+def serialize_decision_log(event: DecisionLog) -> dict:
+    return {
+        "id": event.id,
+        "created_at": event.created_at,
+        "kind": event.kind,
+        "message": event.message,
+        "courier_id": event.courier_id,
+        "return_id": event.return_id,
+        "extra_cost_m": event.extra_cost_m,
+        "baseline_distance_m": event.baseline_distance_m,
+        "saved_distance_m": event.saved_distance_m,
+        "projected_load": event.projected_load,
+        "return_desi": event.return_desi,
+    }
+
+
+def eta_seconds_to_stop(courier: Courier, target_stop: Stop) -> float | None:
+    if target_stop.status == "done":
+        return 0.0
+    if courier.active_stop_id == target_stop.id:
+        return 0.0
+
+    route = pending_route(courier)
+    try:
+        target_index = next(index for index, stop in enumerate(route) if stop.id == target_stop.id)
+    except StopIteration:
+        return None
+
+    eta = 0.0
+    if courier.active_stop_id and courier.active_stop_id != target_stop.id:
+        eta += courier.service_remaining_seconds
+
+    speed_mps = max(0.01, SIM_SPEED_KMH * 1000 / 3600)
+    previous_node = nearest_node(courier.lat, courier.lon)
+    for index, stop in enumerate(route[: target_index + 1]):
+        eta += shortest_path_length_m(previous_node, stop.node) / speed_mps
+        previous_node = stop.node
+        if index < target_index:
+            eta += stop.service_seconds
+    return eta
+
+
+def route_with_etas(courier: Courier) -> list[dict]:
+    return [
+        {
+            **serialize_stop(stop),
+            "eta_seconds": None if stop.status == "done" else round(eta_seconds_to_stop(courier, stop) or 0),
+        }
+        for stop in courier.route
+    ]
+
+
+def serialize_courier(courier: Courier, include_etas: bool = False) -> dict:
+    return {
+        "id": courier.id,
+        "name": courier.name,
+        "capacity_desi": courier.capacity_desi,
+        "current_load": courier.current_load,
+        "free_desi": courier.capacity_desi - courier.current_load,
+        "lat": courier.lat,
+        "lon": courier.lon,
+        "node": courier.node,
+        "color": courier.color,
+        "movement_status": courier.movement_status,
+        "service_remaining_seconds": round(courier.service_remaining_seconds, 1),
+        "route": route_with_etas(courier) if include_etas else [serialize_stop(stop) for stop in courier.route],
+        "polyline": remaining_polyline(courier),
+        "route_error": courier.route_error,
+    }
+
+
+def all_delivery_stops() -> list[tuple[Courier, Stop]]:
+    return [
+        (courier, stop)
+        for courier in state.couriers
+        for stop in courier.route
+        if stop.kind == "delivery"
+    ]
+
+
+def owner_metrics() -> dict:
+    total_extra_m = sum(event.extra_cost_m for event in state.owner_events)
+    total_baseline_m = sum(event.baseline_distance_m for event in state.owner_events)
+    total_saved_m = sum(event.saved_distance_m for event in state.owner_events)
+    dynamic_extra_km = round(total_extra_m / 1000, 2)
+    baseline_pickup_km = round(total_baseline_m / 1000, 2)
+    saved_km = round(total_saved_m / 1000, 2)
+    blocked = [job for job in state.pending_returns if "kapasite" in job.message.lower()]
+    returned_to_hub = sum(1 for courier in state.couriers if courier.movement_status == "done")
+    return {
+        "cost_per_km_tl": COST_PER_KM_TL,
+        "assigned_returns": len(state.owner_events),
+        "pending_returns": len(state.pending_returns),
+        "completed_returns": len(state.completed_returns),
+        "capacity_blocked_returns": len(blocked),
+        "total_extra_km": dynamic_extra_km,
+        "dynamic_extra_km": dynamic_extra_km,
+        "baseline_pickup_km": baseline_pickup_km,
+        "saved_km": saved_km,
+        "baseline_pickup_tl": round(baseline_pickup_km * COST_PER_KM_TL, 2),
+        "dynamic_extra_tl": round(dynamic_extra_km * COST_PER_KM_TL, 2),
+        "saved_tl": round(saved_km * COST_PER_KM_TL, 2),
+        "returned_to_hub": returned_to_hub,
     }
 
 
@@ -1060,27 +1233,11 @@ def state_response() -> dict:
         "graph_source": graph_source,
         "spatial_trigger_km": SPATIAL_TRIGGER_KM,
         "messages": state.messages[-10:],
-        "couriers": [
-            {
-                "id": courier.id,
-                "name": courier.name,
-                "capacity_desi": courier.capacity_desi,
-                "current_load": courier.current_load,
-                "free_desi": courier.capacity_desi - courier.current_load,
-                "lat": courier.lat,
-                "lon": courier.lon,
-                "node": courier.node,
-                "color": courier.color,
-                "movement_status": courier.movement_status,
-                "service_remaining_seconds": round(courier.service_remaining_seconds, 1),
-                "route": [serialize_stop(stop) for stop in courier.route],
-                "polyline": remaining_polyline(courier),
-                "route_error": courier.route_error,
-            }
-            for courier in state.couriers
-        ],
+        "couriers": [serialize_courier(courier, include_etas=True) for courier in state.couriers],
         "pending_returns": [serialize_return(job) for job in state.pending_returns],
         "completed_returns": [serialize_return(job) for job in state.completed_returns],
+        "owner_events": [serialize_decision_log(event) for event in state.owner_events[-50:]],
+        "owner_metrics": owner_metrics(),
         "unassigned_cargos": state.unassigned_cargos,
         "hub_cargo_pool": [serialize_hub_cargo(c) for c in state.hub_cargo_pool],
         "sim_elapsed_seconds": state.sim_elapsed_seconds,
@@ -1152,6 +1309,8 @@ async def start_simulation(request: StartRequest) -> dict:
                         desi=cargo.desi,
                         service_seconds=3,
                         cargo_id=cargo.id,
+                        tracking_code=cargo.id,
+                        customer_label=cargo.label,
                     )
                 )
 
@@ -1221,6 +1380,8 @@ async def start_simulation(request: StartRequest) -> dict:
                         node=node,
                         desi=cargo.desi,
                         service_seconds=3,
+                        tracking_code=f"KBK-{request.seed}-{index + 1}-{stop_num + 1}",
+                        customer_label=f"Musteri {index + 1}-{stop_num + 1}",
                     )
                 )
 
@@ -1346,6 +1507,44 @@ async def tick() -> dict:
 async def get_state() -> dict:
     await advance_running_state()
     return state_response()
+
+
+@app.get("/api/views/customer/{tracking_code}")
+async def customer_view(tracking_code: str) -> dict:
+    await advance_running_state()
+    for courier, stop in all_delivery_stops():
+        if tracking_code not in {stop.tracking_code, stop.cargo_id}:
+            continue
+        eta = eta_seconds_to_stop(courier, stop)
+        return {
+            "tracking_code": tracking_code,
+            "stop": serialize_stop(stop),
+            "courier": serialize_courier(courier),
+            "eta_seconds": None if eta is None else round(eta),
+            "status": "delivered" if stop.status == "done" else "on_route",
+        }
+    raise HTTPException(status_code=404, detail="Takip kodu bulunamadi")
+
+
+@app.get("/api/views/driver/{courier_id}")
+async def driver_view(courier_id: str) -> dict:
+    await advance_running_state()
+    courier = next((item for item in state.couriers if item.id == courier_id), None)
+    if courier is None:
+        raise HTTPException(status_code=404, detail="Arac bulunamadi")
+    return {"courier": serialize_courier(courier, include_etas=True)}
+
+
+@app.get("/api/views/owner")
+async def owner_view() -> dict:
+    await advance_running_state()
+    return {
+        "metrics": owner_metrics(),
+        "couriers": [serialize_courier(courier) for courier in state.couriers],
+        "pending_returns": [serialize_return(job) for job in state.pending_returns],
+        "completed_returns": [serialize_return(job) for job in state.completed_returns],
+        "decision_logs": [serialize_decision_log(event) for event in state.owner_events[-50:]],
+    }
 
 
 @app.get("/api/health")
