@@ -7,6 +7,7 @@ import {
   Pause,
   Play,
   RotateCcw,
+  Route,
   StepForward,
   Truck,
   Timer,
@@ -19,7 +20,7 @@ import {
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000';
 const CENTER = [41.1956, 32.6227];
-const SPEED_OPTIONS = [1, 2, 4, 8];
+const SPEED_OPTIONS = [1, 2, 4, 8, 16];
 
 function markerIcon(color, status) {
   return L.divIcon({
@@ -191,28 +192,32 @@ export default function App() {
           </label>
         </section>
 
-        {/* Start */}
+        {/* Route planning */}
         <section style={{ display: 'grid' }}>
           <button
+            className="btn-plan"
             onClick={() =>
-              run(async () => {
-                await api('/api/sim/start', {
+              run(() =>
+                api('/api/sim/start', {
                   method: 'POST',
                   body: JSON.stringify({ seed, vehicles, working_hours_end_s: workingHoursEndS }),
-                });
-                return api('/api/sim/run', { method: 'POST' });
-              })
+                }),
+              )
             }
             disabled={busy || vehicles.length === 0}
           >
-            <RotateCcw size={18} /> Baslat
+            <Route size={18} /> Rota Planla
           </button>
         </section>
 
         {/* Playback controls */}
         <section className="controls run-controls">
-          <button onClick={() => run(() => api('/api/sim/run', { method: 'POST' }))} disabled={busy || !started || running}>
-            <Play size={18} /> Calistir
+          <button
+            className="btn-start"
+            onClick={() => run(() => api('/api/sim/run', { method: 'POST' }))}
+            disabled={busy || !started || running}
+          >
+            <Play size={18} /> Baslat
           </button>
           <button onClick={() => run(() => api('/api/sim/pause', { method: 'POST' }))} disabled={busy || !started || !running}>
             <Pause size={18} /> Duraklat

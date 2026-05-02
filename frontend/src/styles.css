@@ -114,7 +114,7 @@ h2 {
 
 .speed-control {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 8px;
 }
 
@@ -491,6 +491,25 @@ button:disabled {
   margin: 5px 0 0;
   font-size: 12px;
   color: #b45309;
+}
+
+/* ── Action buttons ── */
+.btn-plan {
+  background: #7c3aed;
+  font-size: 15px;
+  min-height: 46px;
+}
+
+.btn-plan:hover:not(:disabled) {
+  background: #6d28d9;
+}
+
+.btn-start {
+  background: #16a34a;
+}
+
+.btn-start:hover:not(:disabled) {
+  background: #15803d;
 }
 
 /* ── Cargo manifest inside vehicle cards ── */

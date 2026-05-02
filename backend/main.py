@@ -87,7 +87,7 @@ class CargoInput(BaseModel):
 
 
 class SpeedRequest(BaseModel):
-    multiplier: float = Field(default=1.0, ge=0.25, le=8.0)
+    multiplier: float = Field(default=1.0, ge=0.25, le=16.0)
 
 
 @dataclass
@@ -169,7 +169,7 @@ class SimState:
     pending_returns: list[ReturnJob] = field(default_factory=list)
     completed_returns: list[ReturnJob] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)
-    speed_multiplier: float = 2.0
+    speed_multiplier: float = 4.0
     unassigned_cargos: list[dict] = field(default_factory=list)
     hub_cargo_pool: list[HubCargo] = field(default_factory=list)
     sim_elapsed_seconds: float = 0.0
@@ -1163,26 +1163,44 @@ async def start_simulation(request: StartRequest) -> dict:
             couriers.append(courier)
 
     else:
-        # Fallback: random delivery generation (backward-compatible)
-        for index, vehicle in enumerate(request.vehicles):
+        # No explicit cargos: generate random stops then cluster geographically
+        # so each vehicle services a contiguous zone instead of criss-crossing.
+        all_cargo_nodes: list[tuple[CargoInput, int]] = []
+        for v_index, vehicle in enumerate(request.vehicles):
             stop_count = rng.randint(request.min_deliveries, request.max_deliveries)
-            desi_values = split_delivery_load(rng, vehicle.capacity_desi, stop_count)
-            route = []
-            for stop_index in range(stop_count):
+            for j in range(stop_count):
                 node = random_graph_node(rng, used_points)
+                desi = rng.randint(5, min(40, vehicle.capacity_desi))
+                all_cargo_nodes.append((
+                    CargoInput(id=f"auto-{v_index}-{j}", desi=desi),
+                    node,
+                ))
+
+        vehicle_assignments, _ = assign_cargos_geographic(
+            all_cargo_nodes, request.vehicles, hub_node
+        )
+
+        for index, vehicle in enumerate(request.vehicles):
+            assigned_pairs = vehicle_assignments[index]
+            route: list[Stop] = []
+            for stop_num, (cargo, node) in enumerate(assigned_pairs):
                 lat, lon = node_lat_lon(node)
                 route.append(
                     Stop(
                         id=str(uuid4()),
                         kind="delivery",
-                        label=f"Teslimat {stop_index + 1}",
+                        label=f"Teslimat {stop_num + 1}",
                         lat=lat,
                         lon=lon,
                         node=node,
-                        desi=desi_values[stop_index],
+                        desi=cargo.desi,
                         service_seconds=3,
                     )
                 )
+
+            if len(route) > 1:
+                route = nearest_neighbor_sort(hub_node, route)
+
             route.append(
                 Stop(
                     id=str(uuid4()),
@@ -1198,7 +1216,7 @@ async def start_simulation(request: StartRequest) -> dict:
                 id=vehicle.id or f"courier-{index + 1}",
                 name=f"Arac {index + 1}",
                 capacity_desi=vehicle.capacity_desi,
-                current_load=sum(desi_values),
+                current_load=sum(c.desi for c, _ in assigned_pairs),
                 lat=hub_lat,
                 lon=hub_lon,
                 node=hub_node,
