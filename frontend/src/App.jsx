@@ -17,6 +17,7 @@ import {
   PackagePlus,
   Pause,
   Play,
+  Plus,
   RotateCcw,
   Route,
   StepForward,
@@ -252,7 +253,7 @@ function PlanPanel({ capacities, setCapacities, seed, setSeed, endHour, setEndHo
   );
 }
 
-function FleetRail({ state, selected, setSelected, planPanel }) {
+function FleetRail({ state, selected, setSelected, planPanel, onAddVehicle, newVehicleCapacity, setNewVehicleCapacity, busy, started }) {
   const couriers = state?.couriers ?? [];
 
   return (
@@ -269,6 +270,26 @@ function FleetRail({ state, selected, setSelected, planPanel }) {
       </div>
 
       {planPanel}
+
+      {started && (
+        <div className="ret-add">
+          <div className="ret-add-label">Filoya arac ekle</div>
+          <div className="ret-add-row">
+            <input
+              type="number"
+              min="10"
+              max="2000"
+              value={newVehicleCapacity}
+              onChange={(e) => setNewVehicleCapacity(Number(e.target.value))}
+            />
+            <span className="ret-add-unit">desi</span>
+            <button className="ret-add-btn" onClick={onAddVehicle} disabled={busy}>
+              <Plus size={14} />
+              Ekle
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="fleet-list">
         {couriers.length === 0 && <p className="empty-state">Rota planlaninca araclar burada gorunur.</p>}
@@ -619,26 +640,16 @@ function EventsRail({ state, tab, setTab, returnDesi, setReturnDesi, onAddReturn
         <div className="proof-pane">
           <div className="rail-head plain">
             <div>
-              <div className="rail-title">Maliyet Kaniti</div>
-              <div className="rail-sub">{costPerKm} TL/km varsayim</div>
+              <div className="rail-title">Klasik vs Dinamik</div>
+              <div className="rail-sub">{costPerKm} TL/km · Best Insertion</div>
             </div>
           </div>
-          <div className="proof-summary">
-            <div>
-              <span className="mono">{tl(metrics.saved_tl ?? 0)}</span>
-              <small>net kazanc</small>
-            </div>
-            <div>
-              <span className="mono">{kmValue(metrics.saved_km ?? 0)}</span>
-              <small>tasarruf</small>
-            </div>
-            <div>
-              <span className="mono">{tl(metrics.dynamic_extra_tl ?? 0)}</span>
-              <small>ek maliyet</small>
-            </div>
-          </div>
+
+          <ComparisonPanel metrics={metrics} costPerKm={costPerKm} />
+
+          <div className="decision-section-title">Atama Detayları</div>
           <div className="decision-list">
-            {events.length === 0 && <p className="empty-state">Henuz dinamik iade kazanci olusmadi.</p>}
+            {events.length === 0 && <p className="empty-state">Henuz dinamik iade ataması olmadi.</p>}
             {events
               .slice()
               .reverse()
@@ -655,7 +666,7 @@ function EventsRail({ state, tab, setTab, returnDesi, setReturnDesi, onAddReturn
                     <div className="decision-metrics">
                       <span>
                         <b>{kmValue(baselineKm)}</b>
-                        Ayri pickup
+                        Klasik pickup
                       </span>
                       <span>
                         <b>{kmValue(extraKm)}</b>
@@ -663,7 +674,7 @@ function EventsRail({ state, tab, setTab, returnDesi, setReturnDesi, onAddReturn
                       </span>
                       <span>
                         <b>{tl(savedKm * costPerKm)}</b>
-                        Net kazanc
+                        Kazanc
                       </span>
                     </div>
                     <p>{event.message}</p>
@@ -674,6 +685,72 @@ function EventsRail({ state, tab, setTab, returnDesi, setReturnDesi, onAddReturn
         </div>
       )}
     </aside>
+  );
+}
+
+function ComparisonPanel({ metrics, costPerKm }) {
+  const classicKm = metrics.classic_km ?? 0;
+  const classicTl = metrics.classic_tl ?? 0;
+  const classicVehicles = metrics.classic_vehicles ?? 0;
+  const dynamicExtraKm = metrics.dynamic_extra_km ?? 0;
+  const dynamicExtraTl = metrics.dynamic_extra_tl ?? 0;
+  const savedKm = metrics.saved_km ?? 0;
+  const savedTl = metrics.saved_tl ?? 0;
+  const assignedCount = metrics.assigned_returns ?? 0;
+  const savingsPct = classicKm > 0 ? Math.min(100, Math.round((savedKm / classicKm) * 100)) : 0;
+
+  if (assignedCount === 0) {
+    return (
+      <div className="cmp-empty">
+        <div className="cmp-empty-icon">⚖️</div>
+        <div>İade eklenince karşılaştırma görünür</div>
+        <small>İade sekmesinden havuza ekleyin</small>
+      </div>
+    );
+  }
+
+  return (
+    <div className="cmp-wrapper">
+      <div className="cmp-grid">
+        <div className="cmp-col cmp-classic">
+          <div className="cmp-col-tag">KLASİK SİSTEM</div>
+          <div className="cmp-col-algo">
+            Akşam toplu tur · NN sıralaması
+          </div>
+          <div className="cmp-col-km mono">{classicKm.toFixed(1)} km</div>
+          <div className="cmp-col-tl">{classicTl.toFixed(0)} TL</div>
+          <div className="cmp-col-note">
+            {classicVehicles} araç · {assignedCount} iade
+          </div>
+        </div>
+
+        <div className="cmp-vs">VS</div>
+
+        <div className="cmp-col cmp-dynamic">
+          <div className="cmp-col-tag">DİNAMİK SİSTEM</div>
+          <div className="cmp-col-algo">Best Insertion · rotaya ekleme</div>
+          <div className="cmp-col-km mono">{dynamicExtraKm.toFixed(1)} km</div>
+          <div className="cmp-col-tl">{dynamicExtraTl.toFixed(0)} TL</div>
+          <div className="cmp-col-note">
+            0 ekstra araç · {assignedCount} iade mevcut rotaya
+          </div>
+        </div>
+      </div>
+
+      <div className="cmp-savings">
+        <div className="cmp-savings-pct">{savingsPct}%</div>
+        <div className="cmp-savings-body">
+          <div className="cmp-savings-main">
+            <span className="mono">{savedKm.toFixed(1)} km</span> tasarruf ·{' '}
+            <span className="mono">{savedTl.toFixed(0)} TL</span> net kazanç
+          </div>
+          <div className="cmp-savings-sub">
+            Klasik akşam turuna göre {savingsPct}% daha az km ·{' '}
+            {classicVehicles > 1 ? `${classicVehicles} araç yerine 0 ekstra araç` : 'ekstra araç gerekmedi'}
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -761,6 +838,7 @@ export default function App() {
   const [endHour, setEndHour] = useState(18);
   const [selected, setSelected] = useState(null);
   const [rightTab, setRightTab] = useState('proof');
+  const [newVehicleCapacity, setNewVehicleCapacity] = useState(100);
 
   const vehicles = useMemo(
     () =>
@@ -824,6 +902,13 @@ export default function App() {
         body: JSON.stringify({ desi: returnDesi }),
       }),
     );
+  const onAddVehicle = () =>
+    run(() =>
+      api('/api/sim/add_vehicle', {
+        method: 'POST',
+        body: JSON.stringify({ capacity_desi: newVehicleCapacity }),
+      }),
+    );
 
   const planPanel = (
     <PlanPanel
@@ -858,7 +943,17 @@ export default function App() {
       />
 
       <section className="ops-grid">
-        <FleetRail state={state} selected={selected} setSelected={setSelected} planPanel={planPanel} />
+        <FleetRail
+          state={state}
+          selected={selected}
+          setSelected={setSelected}
+          planPanel={planPanel}
+          onAddVehicle={onAddVehicle}
+          newVehicleCapacity={newVehicleCapacity}
+          setNewVehicleCapacity={setNewVehicleCapacity}
+          busy={busy}
+          started={started}
+        />
         <LiveMap state={state} />
         <EventsRail
           state={state}

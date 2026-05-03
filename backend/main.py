@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 KARABUK_CENTER = {"lat": 41.1956, "lon": 32.6227}
 SPATIAL_TRIGGER_KM = float(os.getenv("SPATIAL_TRIGGER_KM", "2.0"))
+CLASSIC_VEHICLE_CAPACITY_DESI = int(os.getenv("CLASSIC_VEHICLE_CAPACITY_DESI", "150"))
 SIM_SPEED_KMH = float(os.getenv("SIM_SPEED_KMH", "70"))
 COST_PER_KM_TL = float(os.getenv("COST_PER_KM_TL", "35"))
 GRAPH_PLACE = os.getenv("GRAPH_PLACE", "Karabuk Merkez, Karabuk, Turkiye")
@@ -90,6 +91,10 @@ class CargoInput(BaseModel):
 
 class SpeedRequest(BaseModel):
     multiplier: float = Field(default=1.0, ge=0.25, le=16.0)
+
+
+class AddVehicleRequest(BaseModel):
+    capacity_desi: int = Field(default=100, gt=0, le=2000)
 
 
 @dataclass
@@ -191,6 +196,10 @@ class SimState:
     couriers: list[Courier] = field(default_factory=list)
     pending_returns: list[ReturnJob] = field(default_factory=list)
     completed_returns: list[ReturnJob] = field(default_factory=list)
+    all_returns_history: list[ReturnJob] = field(default_factory=list)
+    classic_route_km: float = 0.0
+    classic_route_tl: float = 0.0
+    classic_route_vehicles: int = 0
     messages: list[str] = field(default_factory=list)
     owner_events: list[DecisionLog] = field(default_factory=list)
     speed_multiplier: float = 4.0
@@ -1185,13 +1194,78 @@ def all_delivery_stops() -> list[tuple[Courier, Stop]]:
     ]
 
 
+def classic_route_metrics() -> dict:
+    """
+    Simulates the classic end-of-day pickup model:
+    One (or more) dedicated vehicles leave hub after deliveries, collect
+    all returns in nearest-neighbor order, return to hub.
+    Multiple vehicles are used only when total desi exceeds capacity.
+    """
+    assigned_jobs = state.all_returns_history
+    if not assigned_jobs:
+        return {"classic_km": 0.0, "classic_tl": 0.0, "classic_vehicles": 0}
+
+    hub = hub_node()
+    capacity = CLASSIC_VEHICLE_CAPACITY_DESI
+    remaining = list(assigned_jobs)
+    total_distance_m = 0.0
+    vehicles_used = 0
+
+    while remaining:
+        vehicles_used += 1
+        vehicle_load = 0
+        route_stops: list[ReturnJob] = []
+        current = hub
+
+        # Nearest-neighbor fill for this vehicle
+        while remaining:
+            best: ReturnJob | None = None
+            best_cost = float("inf")
+            for job in remaining:
+                if vehicle_load + job.desi > capacity:
+                    continue
+                cost = shortest_path_length_m(current, job.node)
+                if cost < best_cost:
+                    best_cost = cost
+                    best = job
+            if best is None:
+                break
+            route_stops.append(best)
+            vehicle_load += best.desi
+            current = best.node
+            remaining.remove(best)
+
+        if not route_stops:
+            # Remaining jobs don't fit in any vehicle — shouldn't happen, safety exit
+            break
+
+        # Route distance: hub → stop_1 → ... → stop_n → hub
+        leg_nodes = [hub] + [s.node for s in route_stops] + [hub]
+        for a, b in zip(leg_nodes, leg_nodes[1:]):
+            total_distance_m += shortest_path_length_m(a, b)
+
+    classic_km = round(total_distance_m / 1000, 2)
+    return {
+        "classic_km": classic_km,
+        "classic_tl": round(classic_km * COST_PER_KM_TL, 2),
+        "classic_vehicles": vehicles_used,
+    }
+
+
+def refresh_classic_route() -> None:
+    result = classic_route_metrics()
+    state.classic_route_km = result["classic_km"]
+    state.classic_route_tl = result["classic_tl"]
+    state.classic_route_vehicles = result["classic_vehicles"]
+
+
 def owner_metrics() -> dict:
     total_extra_m = sum(event.extra_cost_m for event in state.owner_events)
-    total_baseline_m = sum(event.baseline_distance_m for event in state.owner_events)
-    total_saved_m = sum(event.saved_distance_m for event in state.owner_events)
     dynamic_extra_km = round(total_extra_m / 1000, 2)
-    baseline_pickup_km = round(total_baseline_m / 1000, 2)
-    saved_km = round(total_saved_m / 1000, 2)
+    classic_km = state.classic_route_km
+    # saved_km: klasik akşam turu km'si eksi dinamik sistemin iadelere eklediği ekstra km.
+    # Bu karşılaştırma tutarlı: her iki değer de "iadelerin maliyeti" için aynı referansı kullanır.
+    saved_km = round(max(0.0, classic_km - dynamic_extra_km), 2)
     blocked = [job for job in state.pending_returns if "kapasite" in job.message.lower()]
     returned_to_hub = sum(1 for courier in state.couriers if courier.movement_status == "done")
     return {
@@ -1200,12 +1274,12 @@ def owner_metrics() -> dict:
         "pending_returns": len(state.pending_returns),
         "completed_returns": len(state.completed_returns),
         "capacity_blocked_returns": len(blocked),
-        "total_extra_km": dynamic_extra_km,
         "dynamic_extra_km": dynamic_extra_km,
-        "baseline_pickup_km": baseline_pickup_km,
-        "saved_km": saved_km,
-        "baseline_pickup_tl": round(baseline_pickup_km * COST_PER_KM_TL, 2),
         "dynamic_extra_tl": round(dynamic_extra_km * COST_PER_KM_TL, 2),
+        "classic_km": classic_km,
+        "classic_tl": state.classic_route_tl,
+        "classic_vehicles": state.classic_route_vehicles,
+        "saved_km": saved_km,
         "saved_tl": round(saved_km * COST_PER_KM_TL, 2),
         "returned_to_hub": returned_to_hub,
     }
@@ -1425,15 +1499,17 @@ async def start_simulation(request: StartRequest) -> dict:
         seed=request.seed,
         couriers=couriers,
         pending_returns=deferred_returns,
+        all_returns_history=list(deferred_returns),
         speed_multiplier=state.speed_multiplier,
         messages=messages,
         unassigned_cargos=unassigned_cargo_dicts,
         working_hours_end_s=request.working_hours_end_s,
         sim_elapsed_seconds=0.0,
-        last_hub_cargo_gen_at=-HUB_CARGO_GEN_INTERVAL_S,  # first gen fires after one interval
+        last_hub_cargo_gen_at=-HUB_CARGO_GEN_INTERVAL_S,
     )
     if deferred_returns:
         state.messages.append(f"{len(deferred_returns)} ertelenen iade oncelikli havuza tasindi")
+        refresh_classic_route()
         await evaluate_return_pool()
     return state_response()
 
@@ -1487,7 +1563,9 @@ async def create_return(request: ReturnRequest) -> dict:
         desi=request.desi,
     )
     state.pending_returns.append(job)
+    state.all_returns_history.append(job)
     state.messages.append(f"{request.desi} desi iade havuza eklendi")
+    refresh_classic_route()
     await evaluate_return_pool()
     return state_response()
 
@@ -1496,10 +1574,47 @@ async def create_return(request: ReturnRequest) -> dict:
 async def tick() -> dict:
     if not state.started:
         raise HTTPException(status_code=400, detail="Once simulasyonu baslatin")
+    step = 5.0 * state.speed_multiplier
+    state.sim_elapsed_seconds += step
     for courier in state.couriers:
-        advance_courier(courier, 5.0 * state.speed_multiplier)
+        advance_courier(courier, step)
     state.tick += 1
     await evaluate_return_pool()
+    return state_response()
+
+
+@app.post("/api/sim/add_vehicle")
+async def add_vehicle(request: AddVehicleRequest) -> dict:
+    if not state.started:
+        raise HTTPException(status_code=400, detail="Once simulasyonu baslatin")
+    colors = ["#2563eb", "#f97316", "#16a34a", "#db2777", "#7c3aed", "#0891b2"]
+    hub_node = nearest_node(KARABUK_CENTER["lat"], KARABUK_CENTER["lon"])
+    hub_lat, hub_lon = node_lat_lon(hub_node)
+    index = len(state.couriers)
+    courier = Courier(
+        id=f"courier-extra-{index + 1}",
+        name=f"Arac {index + 1}",
+        capacity_desi=request.capacity_desi,
+        current_load=0,
+        lat=hub_lat,
+        lon=hub_lon,
+        node=hub_node,
+        route=[Stop(
+            id=str(uuid4()),
+            kind="hub",
+            label="Hub",
+            lat=hub_lat,
+            lon=hub_lon,
+            node=hub_node,
+            service_seconds=0,
+        )],
+        color=colors[index % len(colors)],
+        movement_status="idle",
+    )
+    rebuild_courier_path(courier)
+    state.couriers.append(courier)
+    state.messages.append(f"Yeni arac filoya eklendi: {courier.name} ({request.capacity_desi} desi)")
+    try_reload_from_hub(courier)
     return state_response()
 
 
