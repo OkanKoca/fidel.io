@@ -1,4 +1,4 @@
-# Dinamik Kargo Rotalama Demo
+# Fidel.io - Dinamik Kargo Rotalama Demo
 
 FastAPI + React/Vite tabanli OSM graph destekli demo:
 
