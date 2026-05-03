@@ -90,7 +90,7 @@ class CargoInput(BaseModel):
 
 
 class SpeedRequest(BaseModel):
-    multiplier: float = Field(default=1.0, ge=0.25, le=16.0)
+    multiplier: float = Field(default=1.0, ge=0.25, le=64.0)
 
 
 class AddVehicleRequest(BaseModel):

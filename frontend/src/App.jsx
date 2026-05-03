@@ -29,7 +29,7 @@ import {
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000';
 const CENTER = [41.1956, 32.6227];
-const SPEED_OPTIONS = [1, 2, 4, 8, 16];
+const SPEED_OPTIONS = [1, 2, 4, 8, 16, 64];
 
 const STATUS_META = {
   idle: { label: 'Hazir' },
