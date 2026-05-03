@@ -961,6 +961,7 @@ export default function App() {
           if (allDone && !prevFinishedRef.current) {
             setShowSummary(true);
             prevFinishedRef.current = true;
+            api('/api/sim/pause', { method: 'POST' }).catch(() => {});
           }
           if (!next.started) prevFinishedRef.current = false;
 
