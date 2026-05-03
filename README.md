@@ -27,21 +27,3 @@ cd frontend
 npm install
 npm run dev
 ```
-
-Canli hareket hizi varsayilan olarak 35 km/s'dir. Degistirmek icin:
-
-```powershell
-$env:SIM_SPEED_KMH="50"
-```
-
-Graph cache yolunu degistirmek icin:
-
-```powershell
-$env:GRAPH_CACHE_PATH="backend/data/karabuk_drive.graphml"
-```
-
-Graph bolgesini degistirmek icin:
-
-```powershell
-$env:GRAPH_PLACE="Karabuk Merkez, Karabuk, Turkiye"
-```
