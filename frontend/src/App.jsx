@@ -295,10 +295,11 @@ function FleetRail({ state, selected, setSelected, planPanel, onAddVehicle, newV
       <div className="fleet-list">
         {couriers.length === 0 && <p className="empty-state">Rota planlaninca araclar burada gorunur.</p>}
         {couriers.map((courier) => {
-          const pct = Math.min(100, Math.round((courier.current_load / courier.capacity_desi) * 100));
           const pending = courier.route.filter((s) => s.status === 'pending' && s.kind !== 'hub').length;
           const next = courier.route.find((s) => s.status === 'pending' && s.kind !== 'hub');
           const { deliveryLoad, returnLoad } = loadBreakdown(courier);
+          const displayLoad = deliveryLoad + returnLoad;
+          const pct = Math.min(100, Math.round((displayLoad / courier.capacity_desi) * 100));
           const isSel = selected === courier.id;
 
           return (
@@ -326,7 +327,7 @@ function FleetRail({ state, selected, setSelected, planPanel, onAddVehicle, newV
                   ))}
                 </div>
                 <div className="fc-loadnum mono">
-                  {courier.current_load}
+                  {displayLoad}
                   <small>/{courier.capacity_desi}</small>
                 </div>
               </div>
