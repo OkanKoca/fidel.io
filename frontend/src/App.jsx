@@ -78,9 +78,7 @@ function loadBreakdown(courier) {
   const deliveryLoad = courier.route
     .filter((s) => s.kind === 'delivery' && s.status === 'pending')
     .reduce((t, s) => t + s.desi, 0);
-  const returnLoad = courier.route
-    .filter((s) => s.kind === 'return' && s.status === 'pending')
-    .reduce((t, s) => t + s.desi, 0);
+  const returnLoad = Math.max(0, courier.current_load - deliveryLoad);
   return { deliveryLoad, returnLoad };
 }
 
@@ -830,6 +828,66 @@ function TelemetryStrip({ state, connected }) {
   );
 }
 
+function SimSummaryOverlay({ metrics, couriers, onClose }) {
+  const classicKm = metrics.classic_km ?? 0;
+  const dynamicExtraKm = metrics.dynamic_extra_km ?? 0;
+  const savedKm = metrics.saved_km ?? 0;
+  const savedTl = metrics.saved_tl ?? 0;
+  const savingsPct = classicKm > 0 ? Math.min(100, Math.round((savedKm / classicKm) * 100)) : 0;
+  const assigned = metrics.assigned_returns ?? 0;
+  const completed = metrics.completed_returns ?? 0;
+
+  return (
+    <div className="summary-overlay">
+      <div className="summary-modal">
+        <div className="summary-header">
+          <span className="summary-icon">🎉</span>
+          <h2>Simülasyon Tamamlandı</h2>
+        </div>
+
+        <div className="summary-grid">
+          <div className="summary-col summary-classic">
+            <div className="summary-col-label">KLASİK SİSTEM</div>
+            <div className="summary-col-km">{classicKm.toFixed(1)} km</div>
+            <div className="summary-col-sub">Akşam toplu tur · {metrics.classic_vehicles ?? 0} araç</div>
+          </div>
+          <div className="summary-vs">VS</div>
+          <div className="summary-col summary-dynamic">
+            <div className="summary-col-label">DİNAMİK SİSTEM</div>
+            <div className="summary-col-km">{dynamicExtraKm.toFixed(1)} km</div>
+            <div className="summary-col-sub">Best Insertion · 0 ekstra araç</div>
+          </div>
+        </div>
+
+        <div className="summary-savings">
+          <div className="summary-pct">{savingsPct}%</div>
+          <div className="summary-savings-text">
+            <strong>{savedKm.toFixed(1)} km</strong> tasarruf &nbsp;·&nbsp;
+            <strong>{Math.round(savedTl)} TL</strong> net kazanç
+          </div>
+        </div>
+
+        <div className="summary-stats">
+          <div className="summary-stat">
+            <span className="summary-stat-val">{assigned}</span>
+            <span className="summary-stat-lbl">Dinamik Atama</span>
+          </div>
+          <div className="summary-stat">
+            <span className="summary-stat-val">{completed}</span>
+            <span className="summary-stat-lbl">Tamamlanan İade</span>
+          </div>
+          <div className="summary-stat">
+            <span className="summary-stat-val">{couriers.length}</span>
+            <span className="summary-stat-lbl">Araç</span>
+          </div>
+        </div>
+
+        <button className="summary-close" onClick={onClose}>Kapat</button>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [state, setState] = useState(null);
   const [error, setError] = useState('');
@@ -838,10 +896,14 @@ export default function App() {
   const [returnDesi, setReturnDesi] = useState(15);
   const [busy, setBusy] = useState(false);
   const [connected, setConnected] = useState(false);
-  const [endHour, setEndHour] = useState(18);
+  const [endHour, setEndHour] = useState(11);
   const [selected, setSelected] = useState(null);
   const [rightTab, setRightTab] = useState('proof');
   const [newVehicleCapacity, setNewVehicleCapacity] = useState(100);
+  const [toasts, setToasts] = useState([]);
+  const [showSummary, setShowSummary] = useState(false);
+  const prevEventCountRef = useState({ current: 0 })[0];
+  const prevFinishedRef = useState({ current: false })[0];
 
   const vehicles = useMemo(
     () =>
@@ -870,7 +932,39 @@ export default function App() {
   useEffect(() => {
     const t = setInterval(async () => {
       try {
-        setState(await api('/api/sim/state'));
+        const next = await api('/api/sim/state');
+        setState((prev) => {
+          // Toast: yeni atama kararı gelince bildirim göster
+          const prevCount = prevEventCountRef.current;
+          const newEvents = next.owner_events ?? [];
+          if (newEvents.length > prevCount) {
+            const newOnes = newEvents.slice(prevCount);
+            newOnes.forEach((ev) => {
+              const extraKm = ((ev.extra_cost_m ?? 0) / 1000).toFixed(1);
+              const savedKm = ((ev.saved_distance_m ?? 0) / 1000).toFixed(1);
+              const id = ev.id;
+              setToasts((ts) => [
+                ...ts.slice(-3),
+                { id, text: `✅ ${ev.return_desi ?? 0} desi iade → +${extraKm} km · ${savedKm} km tasarruf` },
+              ]);
+              setTimeout(() => setToasts((ts) => ts.filter((t) => t.id !== id)), 3500);
+            });
+            prevEventCountRef.current = newEvents.length;
+          }
+
+          // Özet ekranı: tüm araçlar "done" olunca
+          const allDone =
+            next.started &&
+            next.couriers?.length > 0 &&
+            next.couriers.every((c) => c.movement_status === 'done');
+          if (allDone && !prevFinishedRef.current) {
+            setShowSummary(true);
+            prevFinishedRef.current = true;
+          }
+          if (!next.started) prevFinishedRef.current = false;
+
+          return next;
+        });
         setConnected(true);
       } catch {
         setConnected(false);
@@ -887,13 +981,18 @@ export default function App() {
   const simEnd = state?.working_hours_end_s ?? workingHoursEndS;
   const simProgress = simEnd > 0 ? Math.min(1, Math.max(0, simElapsed / simEnd)) : 0;
 
-  const onPlan = () =>
-    run(() =>
+  const onPlan = () => {
+    prevEventCountRef.current = 0;
+    prevFinishedRef.current = false;
+    setShowSummary(false);
+    setToasts([]);
+    return run(() =>
       api('/api/sim/start', {
         method: 'POST',
         body: JSON.stringify({ seed, vehicles, working_hours_end_s: workingHoursEndS }),
       }),
     );
+  };
   const onRun = () => run(() => api('/api/sim/run', { method: 'POST' }));
   const onPause = () => run(() => api('/api/sim/pause', { method: 'POST' }));
   const onStep = () => run(() => api('/api/sim/tick', { method: 'POST' }));
@@ -927,8 +1026,26 @@ export default function App() {
     />
   );
 
+  const metrics = state?.owner_metrics ?? {};
+
   return (
     <main className="ops-root">
+      {showSummary && (
+        <SimSummaryOverlay
+          metrics={metrics}
+          couriers={state?.couriers ?? []}
+          onClose={() => setShowSummary(false)}
+        />
+      )}
+
+      {toasts.length > 0 && (
+        <div className="toast-stack">
+          {toasts.map((t) => (
+            <div key={t.id} className="toast-assignment">{t.text}</div>
+          ))}
+        </div>
+      )}
+
       <CommandBar
         state={state}
         started={started}
