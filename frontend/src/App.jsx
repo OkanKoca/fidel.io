@@ -78,7 +78,10 @@ function loadBreakdown(courier) {
   const deliveryLoad = courier.route
     .filter((s) => s.kind === 'delivery' && s.status === 'pending')
     .reduce((t, s) => t + s.desi, 0);
-  return { deliveryLoad, returnLoad: Math.max(0, courier.current_load - deliveryLoad) };
+  const returnLoad = courier.route
+    .filter((s) => s.kind === 'return' && s.status === 'pending')
+    .reduce((t, s) => t + s.desi, 0);
+  return { deliveryLoad, returnLoad };
 }
 
 function kmValue(value = 0) {
@@ -341,7 +344,7 @@ function FleetRail({ state, selected, setSelected, planPanel, onAddVehicle, newV
                 {courier.service_remaining_seconds > 0 && (
                   <>
                     <span className="dot-sep">·</span>
-                    <span className="warn-text">{courier.service_remaining_seconds}s servis</span>
+                    <span className="warn-text">{Math.ceil(courier.service_remaining_seconds)}s servis</span>
                   </>
                 )}
               </div>
@@ -779,7 +782,7 @@ function TelemetryStrip({ state, connected }) {
   const couriers = state?.couriers ?? [];
   const routeStops = couriers.flatMap((c) => c.route).filter((s) => s.kind !== 'hub').length;
   const routePoints = couriers.reduce((sum, c) => sum + (c.polyline?.length ?? 0), 0);
-  const insertions = (state?.completed_returns?.length ?? 0) + (state?.pending_returns?.filter((r) => r.assigned).length ?? 0);
+  const insertions = (state?.completed_returns?.length ?? 0) + (state?.pending_returns?.filter((r) => r.assigned_courier_id).length ?? 0);
   const metrics = state?.owner_metrics ?? {};
 
   return (
@@ -805,8 +808,8 @@ function TelemetryStrip({ state, connected }) {
       </div>
       <div className="tel-divider" />
       <div className="tel-cell">
-        <span className="tel-eye">AYRI PICKUP</span>
-        <strong className="mono">{kmValue(metrics.baseline_pickup_km ?? 0)}</strong>
+        <span className="tel-eye">KLASİK TUR</span>
+        <strong className="mono">{kmValue(metrics.classic_km ?? 0)}</strong>
       </div>
       <div className="tel-divider" />
       <div className="tel-cell">
@@ -878,7 +881,7 @@ export default function App() {
 
   const started = Boolean(state?.started);
   const running = Boolean(state?.running);
-  const workingHoursEndS = Math.max(1, (endHour - 10) * 3600);
+  const workingHoursEndS = Math.max(3600, (Math.max(11, endHour) - 10) * 3600);
   const totalCapacity = state?.couriers?.reduce((s, c) => s + c.capacity_desi, 0) ?? vehicles.reduce((s, v) => s + v.capacity_desi, 0);
   const simElapsed = state?.sim_elapsed_seconds ?? 0;
   const simEnd = state?.working_hours_end_s ?? workingHoursEndS;

@@ -965,13 +965,13 @@ async def try_assign_return(job: ReturnJob) -> bool:
             continue
 
         chain_nodes = [nearest_node(courier.lat, courier.lon)] + [stop.node for stop in route]
-        for idx in range(len(chain_nodes) - 1):
+        for idx in range(len(chain_nodes)):
             projected_load = projected_load_before_insert(courier, idx)
             if projected_load + job.desi > courier.capacity_desi:
                 continue
 
             a_node = chain_nodes[idx]
-            b_node = chain_nodes[idx + 1]
+            b_node = chain_nodes[idx + 1] if idx + 1 < len(chain_nodes) else hub_node()
             extra_cost = (
                 distance(a_node, job.node)
                 + distance(job.node, b_node)
@@ -1007,7 +1007,7 @@ async def try_assign_return(job: ReturnJob) -> bool:
     job.status = "assigned"
     job.assigned_courier_id = courier.id
     job.deferred = False
-    baseline_distance = shortest_path_length_m(hub_node(), job.node) + shortest_path_length_m(job.node, hub_node())
+    baseline_distance = shortest_path_length_m(hub_node(), job.node)
     saved_distance = max(0.0, baseline_distance - extra_cost)
     job.extra_cost_m = extra_cost
     job.baseline_distance_m = baseline_distance
@@ -1037,8 +1037,12 @@ async def try_assign_return(job: ReturnJob) -> bool:
 
 
 def simulation_finished() -> bool:
-    return state.started and bool(state.couriers) and all(
-        courier.movement_status == "done" for courier in state.couriers
+    hub_has_waiting = any(c.status == "waiting" for c in state.hub_cargo_pool)
+    return (
+        state.started
+        and bool(state.couriers)
+        and not hub_has_waiting
+        and all(courier.movement_status == "done" for courier in state.couriers)
     )
 
 
